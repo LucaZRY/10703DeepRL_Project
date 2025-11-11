@@ -1,0 +1,49 @@
+name: drl-diffdist
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  # ---- Core scientific stack
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - scikit-image
+  - scikit-learn
+  - ffmpeg
+  - swig               # needed for Box2D build
+  - cmake
+  # ---- RL / Sim
+  - gymnasium=0.29.*   # modern Gym API
+  - pip
+  - pytorch::pytorch=2.4.*
+  - pytorch::torchvision=0.19.*
+  - pytorch::torchaudio=2.4.*
+  - nvidia::pytorch-cuda=12.1  # skip on CPU-only machines
+  # ---- Logging / Viz
+  - tensorboard
+  - pip:
+      # CarRacing deps and extras
+      - gymnasium[box2d]==0.29.1   # ensures Box2D extras
+      - box2d-py==2.3.8            # reliable Box2D wheel on most systems
+      - pygame==2.5.2              # some render helpers use it
+      - imageio
+      - imageio-ffmpeg
+      - moviepy
+      # RL baselines (nice for quick checks/abls)
+      - stable-baselines3==2.3.0   # works with Gymnasium
+      - minari                     # if you decide to use offline datasets
+      # Diffusion & helpers
+      - einops
+      - ema-pytorch
+      - accelerate
+      - omegaconf
+      - hydra-core
+      # Logging / experiment mgmt
+      - wandb
+      # Dev utils
+      - rich
+      - tqdm
