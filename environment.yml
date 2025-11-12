@@ -1,4 +1,4 @@
-name: drl-diffdist
+name: deeprl_project
 channels:
   - pytorch
   - nvidia
