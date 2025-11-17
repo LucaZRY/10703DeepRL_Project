@@ -31,7 +31,7 @@ dependencies:
   - tensorboard
 
   - pip:
-      # Box2D (gymnasium expects v2.3.5)
+ 
       - box2d-py
 
       - pygame==2.5.2
