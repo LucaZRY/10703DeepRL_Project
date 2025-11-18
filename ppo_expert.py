@@ -124,7 +124,7 @@ class Critic(nn.Module):
 class PPOConfig:
     action_dim: int = 5
     obs_channels: int = 4
-    episodes: int = 500
+    episodes: int = 1500
     horizon: int = 1024
     gamma: float = 0.99
     lam: float = 0.95
