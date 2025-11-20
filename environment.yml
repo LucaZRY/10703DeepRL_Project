@@ -1,12 +1,12 @@
 name: drl-diffdist
 channels:
   - pytorch
-  - nvidia
   - conda-forge
   - defaults
 dependencies:
   - python=3.10
-  # ---- Core scientific stack
+
+  # Core scientific stack
   - numpy
   - scipy
   - pandas
@@ -14,36 +14,73 @@ dependencies:
   - scikit-image
   - scikit-learn
   - ffmpeg
-  - swig               # needed for Box2D build
+  - swig
   - cmake
-  # ---- RL / Sim
-  - gymnasium=0.29.*   # modern Gym API
+  - opencv  # <-- Added here
+
+  # RL / Sim
+  - gymnasium=0.29.1
   - pip
-  - pytorch::pytorch=2.4.*
-  - pytorch::torchvision=0.19.*
-  - pytorch::torchaudio=2.4.*
-  - nvidia::pytorch-cuda=12.1  # skip on CPU-only machines
-  # ---- Logging / Viz
+
+  # PyTorch (CPU build -> avoids CUDA conflicts)
+  - pytorch
+  - torchvision
+  - torchaudio
+
+  # Logging / Viz
   - tensorboard
+
   - pip:
-      # CarRacing deps and extras
-      - gymnasium[box2d]==0.29.1   # ensures Box2D extras
-      - box2d-py==2.3.8            # reliable Box2D wheel on most systems
-      - pygame==2.5.2              # some render helpers use it
+ 
+      - box2d-py
+
+      - pygame==2.5.2
       - imageio
       - imageio-ffmpeg
       - moviepy
-      # RL baselines (nice for quick checks/abls)
-      - stable-baselines3==2.3.0   # works with Gymnasium
-      - minari                     # if you decide to use offline datasets
-      # Diffusion & helpers
+      - stable-baselines3==2.3.0
+      - minari
+
+      # Diffusion helpers
       - einops
       - ema-pytorch
       - accelerate
+
+      # Config / logging
       - omegaconf
       - hydra-core
-      # Logging / experiment mgmt
       - wandb
-      # Dev utils
       - rich
       - tqdm
+
+
+
+# name: drl-diffdist
+# channels:
+#   - pytorch
+#   - conda-forge
+#   - defaults
+
+# dependencies:
+#   # Core
+#   - python=3.9
+#   - numpy
+#   - matplotlib
+#   - pillow
+#   - tqdm
+#   - imageio
+
+#   # RL / sim
+#   - gymnasium=0.29.1
+#   - box2d-py       # version Gymnasium expects
+#   - pygame
+
+#   # PyTorch (CPU or GPU auto-chosen by conda)
+#   - pytorch>=2.0.1
+
+#   # pip itself
+#   - pip
+
+#   # Extra pip packages
+#   - pip:
+#       - diffusers
