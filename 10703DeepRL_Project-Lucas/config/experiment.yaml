@@ -1,0 +1,118 @@
+# Experiment config for Diffusion→Student Distillation on CarRacing
+seed: 42
+device: "cuda"        # "cpu" if no GPU
+project_name: "CarRacing-DiffDist"
+run_name: "baseline_adv_weighted"
+
+env:
+  id: "CarRacing-v2"
+  frame_skip: 1
+  action_repeat: 1
+  render_mode: null           # "human" for local debugging
+  observation:
+    grayscale: true
+    resize: [84, 84]
+    frame_stack: 4
+  wrappers:
+    - "AtariPreprocessingLike"  # your lightweight preprocess (grayscale/resize)
+    - "FrameStack"              # stack k frames
+  max_episode_steps: 1000
+
+replay:
+  capacity: 1_000_000
+  batch_size: 256
+  init_random_steps: 10_000
+  prioritized: false
+
+teacher:                # diffusion policy as teacher
+  type: "trajectory_diffusion"
+  ckpt: "checkpoints/teacher_diffusion.pt"
+  num_denoise_steps: 10          # fast sampling at train time
+  guidance_scale: 1.0
+  max_recovery_horizon: 60       # steps for generated recovery trajectory
+  sample_temperature: 1.0
+  # uncertainty estimates (for prioritized distillation)
+  estimate_uncertainty: true
+  num_samples_for_uncertainty: 4
+
+student:                # small policy distilled from teacher
+  algo: "SAC"           # (TD3 also fine)
+  actor:
+    hidden_sizes: [256, 256]
+    activation: "relu"
+    lr: 3.0e-4
+  critic:
+    hidden_sizes: [256, 256]
+    activation: "relu"
+    lr: 3.0e-4
+  gamma: 0.99
+  tau: 0.005
+  target_update_interval: 1
+  alpha_auto_tune: true
+  entropy_target: "auto"
+  gradient_clip_norm: 10.0
+
+distillation:
+  enabled: true
+  objective: "kl"               # "kl" | "mse"
+  # Advantage-weighted soft distillation
+  weight_mode: "advantage"      # "uniform" | "advantage" | "uncertainty"
+  advantage:
+    alpha: 1.0                  # exp(alpha * A)
+    normalize_batch: true
+    critic_target: "QminusV"    # Q(s,a) - V(s); alt: "Qonly"
+  uncertainty:
+    mode: "entropy"             # or "var"
+    temperature: 1.0
+    invert: false               # if true, downweight high-uncertainty
+  lambda_kl: 1.0                # global weight for distillation loss
+  # which samples receive distillation:
+  apply_on:
+    teacher_segments: true      # recovery segments proposed by teacher
+    student_segments: false     # also distill on nominal behavior if true
+    offline_buffer: false       # if you also have an offline demo buffer
+
+dagger_recovery:
+  enabled: true
+  trigger:
+    offtrack_angle_deg: 15.0    # e.g., heading error threshold
+    offtrack_distance: 1.5      # meters from centerline
+    speed_drop: 0.4             # ratio vs running avg speed
+  label_strategy: "trajectory"  # "single_action" | "trajectory"
+  rollout_horizon: 40           # how long to roll teacher during recovery
+  add_to_buffer: true
+  buffer_tag: "recovery"
+
+training:
+  total_env_steps: 2_000_000
+  grad_updates_per_step: 1
+  eval_interval_steps: 20_000
+  save_interval_steps: 100_000
+  log_interval_steps: 1_000
+  checkpoint_dir: "checkpoints/"
+  video:
+    record: true
+    every_eval: true
+    max_videos: 5
+
+evaluation:
+  episodes: 10
+  record_video: true
+  perturb_on_reset:
+    enabled: true
+    lateral_jitter: 0.8       # meters
+    heading_jitter_deg: 8.0   # degrees
+    speed_jitter: 0.2         # fraction of nominal
+
+ablation:   # flip these for quick studies
+  use_advantage_weighting: true
+  use_uncertainty_weighting: false
+  use_recovery_only_distill: true
+  use_student_rl_without_distill: false
+
+logging:
+  use_wandb: true
+  entity: null       # your wandb user/org
+  project: "${project_name}"
+  name: "${run_name}"
+  tensorboard_dir: "tb_logs/"
