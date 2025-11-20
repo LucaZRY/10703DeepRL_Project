@@ -9,8 +9,8 @@
 ├── ppo_expert.py                      # PPO expert policy implementation
 ├── diffusion_dagger_trainer.py        # Main diffusion-DAgger trainer
 ├── environment.yml                    # Conda environment specification
-├── 10703DeepRL_Project-Lucas/         # Lucas's contributions
-├── 10703DeepRL_Project-Tianyun/       # Tianyun's contributions
+├── 10703DeepRL_Project-Lucas/         
+├── 10703DeepRL_Project-Tianyun/       
 └── data/                              # Generated datasets
 ```
 
@@ -201,7 +201,7 @@ Main training pipeline implementing:
 
 ## Expected Results
 
-We anticipate:
+I anticipate:
 1. **Improved Sample Efficiency**: Learning from synthetic recovery data
 2. **Enhanced Robustness**: Better handling of failure scenarios
 3. **Training Stability**: Reduced variance through trajectory-level guidance
@@ -255,13 +255,8 @@ Success metrics:
 - Enable data compression for large datasets
 - Batch data processing for efficiency
 
-## Contributing
 
-When extending this codebase:
-1. Follow existing code style and documentation patterns
-2. Add comprehensive docstrings and type hints
-3. Include validation tests for new data formats
-4. Update README for new features or dependencies
+
 
 ## References
 
