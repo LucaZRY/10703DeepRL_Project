@@ -1,0 +1,9 @@
+# RL datasets – do not track in Git
+*.npz
+*.npy
+*.pt
+*.pth
+*.pyc
+*.pkl
+data/
+results/

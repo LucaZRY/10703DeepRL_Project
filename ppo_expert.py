@@ -1,394 +1,373 @@
-import gymnasium as gym
+"""
+Pure PPO expert for CarRacing-v2 (continuous) + dataset saver.
+
+- Env: CarRacing-v2 with continuous actions [steer, gas, brake]
+- Obs: stacked grayscale frames (4, 84, 84), float32 in [0,1]
+- Outputs: carracing_ppo_dataset.npz
+    - obs: (N, 4, 84, 84)
+    - actions: (N, 3)
+    - rewards: (N,)
+    - dones: (N,)
+"""
+
 import numpy as np
+import gymnasium as gym
+from gymnasium.wrappers import GrayScaleObservation, ResizeObservation, FrameStack
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-import cv2
 from dataclasses import dataclass
-from typing import Tuple, List
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
 
 
-# -------------------------
-# Image preprocessing + env
-# -------------------------
+# --------------------------
+# Env + preprocessing
+# --------------------------
 
-def image_preprocessing(img: np.ndarray) -> np.ndarray:
-    """Resize to 84x84 and convert to grayscale in [0,1]."""
-    img = cv2.resize(img, dsize=(84, 84))
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) / 255.0
-    return img.astype(np.float32)
-
-
-class CarEnvironment(gym.Wrapper):
+def make_env(render_mode=None):
     """
-    Discrete CarRacing-v2 wrapper with:
-      - no-op on reset
-      - frame skipping
-      - frame stacking (4x84x84)
+    CarRacing-v2 continuous env with:
+      - grayscale
+      - 84x84
+      - 4-frame stack
     """
-
-    def __init__(self, env, skip_frames: int = 4, stack_frames: int = 4, no_operation: int = 50, **kwargs):
-        super().__init__(env, **kwargs)
-        self._no_operation = no_operation
-        self._skip_frames = skip_frames
-        self._stack_frames = stack_frames
-        self.stack_state = None
-
-    def reset(self, **kwargs):
-        observation, info = self.env.reset(**kwargs)
-
-        # Do-nothing steps to randomize initial state a bit
-        for _ in range(self._no_operation):
-            observation, reward, terminated, truncated, info = self.env.step(0)
-
-        observation = image_preprocessing(observation)
-        self.stack_state = np.tile(observation, (self._stack_frames, 1, 1))
-        return self.stack_state, info
-
-    def step(self, action):
-        total_reward = 0.0
-        terminated = False
-        truncated = False
-        info = {}
-        observation = None
-
-        for _ in range(self._skip_frames):
-            observation, reward, terminated, truncated, info = self.env.step(action)
-            total_reward += reward
-            if terminated or truncated:
-                break
-
-        observation = image_preprocessing(observation)
-        self.stack_state = np.concatenate((self.stack_state[1:], observation[np.newaxis]), axis=0)
-        return self.stack_state, total_reward, terminated, truncated, info
+    env = gym.make("CarRacing-v2", continuous=True, render_mode=render_mode)
+    env = GrayScaleObservation(env, keep_dim=True)  # (H, W, 1)
+    env = ResizeObservation(env, 84)               # (84, 84, 1)
+    env = FrameStack(env, num_stack=4)             # (84, 84, 4)
+    return env
 
 
-# -------------------------
-# Networks
-# -------------------------
+def preprocess_obs(obs):
+    """
+    Convert env obs into shape (4, 84, 84) float32 in [0,1].
+    Handles:
+    - (84,84,4) from FrameStack (H,W,stack)
+    - (4,84,84) already channels-first
+    """
+    arr = np.array(obs)
 
-class Actor(nn.Module):
-    def __init__(self, in_channels: int, out_dim: int):
+    # Squeeze weird singleton dims if any
+    while arr.ndim > 3 and (arr.shape[0] == 1 or arr.shape[-1] == 1):
+        if arr.shape[-1] == 1:
+            arr = arr.squeeze(-1)
+        elif arr.shape[0] == 1:
+            arr = arr.squeeze(0)
+        else:
+            break
+
+    if arr.ndim == 3:
+        # (H,W,4)
+        if arr.shape[-1] == 4:
+            arr = arr.astype(np.float32) / 255.0
+            arr = np.transpose(arr, (2, 0, 1))  # -> (4,H,W)
+        # (4,H,W)
+        elif arr.shape[0] == 4:
+            arr = arr.astype(np.float32)
+        # (H,W,1) → tile to 4
+        elif arr.shape[-1] == 1:
+            img = arr[..., 0].astype(np.float32) / 255.0
+            arr = np.tile(img[None, ...], (4, 1, 1))
+        else:
+            img = arr.astype(np.float32) / 255.0
+            arr = np.tile(img[None, ...], (4, 1, 1))
+    elif arr.ndim == 2:
+        img = arr.astype(np.float32) / 255.0
+        arr = np.tile(img[None, ...], (4, 1, 1))
+    else:
+        raise ValueError(f"Unexpected obs shape in preprocess_obs: {arr.shape}")
+
+    return arr  # (4,84,84)
+
+
+# --------------------------
+# PPO network: CNN + Gaussian policy
+# --------------------------
+
+class ActorCritic(nn.Module):
+    def __init__(self, obs_channels=4, act_dim=3):
         super().__init__()
-        self._n_features = 32 * 9 * 9
+        self.act_dim = act_dim
+
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=8, stride=4),
+            nn.Conv2d(obs_channels, 32, kernel_size=8, stride=4),  # -> (32,20,20)
             nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),            # -> (64,9,9)
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),            # -> (64,7,7)
             nn.ReLU(),
         )
+
         self.fc = nn.Sequential(
-            nn.Linear(self._n_features, 256),
+            nn.Linear(64 * 7 * 7, 256),
             nn.ReLU(),
-            nn.Linear(256, out_dim),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.mu_head = nn.Linear(256, act_dim)
+        self.v_head = nn.Linear(256, 1)
+
+        # log_std as a parameter (independent per action dim)
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
+
+    def forward(self, x):
+        # x: (B,4,84,84)
         x = self.conv(x)
-        x = x.view(-1, self._n_features)
+        x = x.view(x.size(0), -1)
         x = self.fc(x)
-        return x  # logits over discrete actions
+        mu = self.mu_head(x)           # (B,3)
+        v = self.v_head(x).squeeze(-1) # (B,)
+        return mu, v
+
+    def get_dist_value(self, x):
+        mu, v = self.forward(x)
+        std = torch.exp(self.log_std)
+        dist = torch.distributions.Normal(mu, std)
+        return dist, v
 
 
-class Critic(nn.Module):
-    def __init__(self, in_channels: int):
-        super().__init__()
-        self._n_features = 32 * 9 * 9
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2),
-            nn.ReLU(),
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(self._n_features, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+# --------------------------
+# PPO buffer with GAE
+# --------------------------
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.conv(x)
-        x = x.view(-1, self._n_features)
-        x = self.fc(x)
-        return x.squeeze(-1)  # value scalar
+class PPOBuffer:
+    def __init__(self, obs_shape, act_dim, size, gamma=0.99, lam=0.95):
+        self.obs_buf = np.zeros((size, *obs_shape), dtype=np.float32)
+        self.act_buf = np.zeros((size, act_dim), dtype=np.float32)
+        self.rew_buf = np.zeros(size, dtype=np.float32)
+        self.done_buf = np.zeros(size, dtype=np.float32)
+        self.val_buf = np.zeros(size, dtype=np.float32)
+        self.logp_buf = np.zeros(size, dtype=np.float32)
+
+        self.adv_buf = np.zeros(size, dtype=np.float32)
+        self.ret_buf = np.zeros(size, dtype=np.float32)
+
+        self.gamma = gamma
+        self.lam = lam
+        self.ptr = 0
+        self.path_start = 0
+        self.max_size = size
+
+    def store(self, obs, act, rew, done, val, logp):
+        assert self.ptr < self.max_size
+        self.obs_buf[self.ptr] = obs
+        self.act_buf[self.ptr] = act
+        self.rew_buf[self.ptr] = rew
+        self.done_buf[self.ptr] = done
+        self.val_buf[self.ptr] = val
+        self.logp_buf[self.ptr] = logp
+        self.ptr += 1
+
+    def finish_path(self, last_val=0.0):
+        """
+        Call at end of trajectory or when buffer is full.
+        Uses GAE-Lambda to compute advantage estimates.
+        """
+        end = self.ptr
+        rews = np.append(self.rew_buf[self.path_start:end], last_val)
+        vals = np.append(self.val_buf[self.path_start:end], last_val)
+
+        gae = 0.0
+        for t in reversed(range(end - self.path_start)):
+            nonterminal = 1.0 - self.done_buf[self.path_start + t]
+            delta = rews[t] + self.gamma * vals[t + 1] * nonterminal - vals[t]
+            gae = delta + self.gamma * self.lam * nonterminal * gae
+            self.adv_buf[self.path_start + t] = gae
+
+        self.ret_buf[self.path_start:end] = self.adv_buf[self.path_start:end] + self.val_buf[self.path_start:end]
+        self.path_start = self.ptr
+
+    def get(self):
+        """
+        Return all data from the buffer, with advantages normalized.
+        """
+        assert self.ptr == self.max_size  # buffer full
+        self.ptr = 0
+        self.path_start = 0
+
+        adv = self.adv_buf
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        data = dict(obs=self.obs_buf,
+                    act=self.act_buf,
+                    ret=self.ret_buf,
+                    adv=adv,
+                    logp=self.logp_buf)
+        return {k: torch.as_tensor(v, dtype=torch.float32, device=device) for k, v in data.items()}
 
 
-# -------------------------
-# PPO Agent (discrete)
-# -------------------------
+# --------------------------
+# PPO config + agent
+# --------------------------
 
 @dataclass
 class PPOConfig:
-    action_dim: int = 5
-    obs_channels: int = 4
-    episodes: int = 1500
-    horizon: int = 1024
+    total_steps: int = 200_000        # total environment steps
+    steps_per_epoch: int = 2048       # rollout size
     gamma: float = 0.99
     lam: float = 0.95
-    lr_actor: float = 1e-4
-    lr_critic: float = 1e-4
-    clip_eps: float = 0.2
-    n_updates: int = 3
-    batch_size: int = 64
-    save_path: str = "ppo_discrete_carracing.pt"
+    clip_ratio: float = 0.2
+    pi_lr: float = 3e-4
+    v_lr: float = 1e-3
+    train_pi_iters: int = 80
+    train_v_iters: int = 80
+    max_ep_len: int = 1000
 
 
 class PPOAgent:
     def __init__(self, cfg: PPOConfig):
         self.cfg = cfg
-        self.actor = Actor(cfg.obs_channels, cfg.action_dim).to(device)
-        self.critic = Critic(cfg.obs_channels).to(device)
-        self.actor_optim = Adam(self.actor.parameters(), lr=cfg.lr_actor)
-        self.critic_optim = Adam(self.critic.parameters(), lr=cfg.lr_critic)
-        self.total_rewards: List[float] = []
+        self.env = make_env(render_mode=None)
+        obs_shape = (4, 84, 84)
+        act_dim = 3
 
-    def select_action(self, state: np.ndarray) -> Tuple[int, float]:
-        """
-        state: (4,84,84) numpy -> discrete action index, log_prob
-        """
-        s = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-        logits = self.actor(s)
-        probs = torch.softmax(logits, dim=-1)
-        dist = torch.distributions.Categorical(probs)
-        action = dist.sample()
-        logp = dist.log_prob(action)
-        return int(action.item()), float(logp.item())
+        self.ac = ActorCritic(obs_channels=4, act_dim=act_dim).to(device)
+        self.pi_optimizer = Adam(self.ac.parameters(), lr=cfg.pi_lr)
+        self.v_optimizer = Adam(self.ac.parameters(), lr=cfg.v_lr)
 
-    def evaluate_actions(self, states: torch.Tensor, actions: torch.Tensor):
-        logits = self.actor(states)
-        probs = torch.softmax(logits, dim=-1)
-        dist = torch.distributions.Categorical(probs)
-        logp = dist.log_prob(actions)
-        entropy = dist.entropy()
-        values = self.critic(states)
-        return logp, entropy, values
+        self.buf = PPOBuffer(
+            obs_shape=obs_shape,
+            act_dim=act_dim,
+            size=cfg.steps_per_epoch,
+            gamma=cfg.gamma,
+            lam=cfg.lam,
+        )
 
-    def compute_gae(self, rewards, dones, values, last_value):
+        # For saving dataset
+        self.dataset_obs = []
+        self.dataset_actions = []
+        self.dataset_rewards = []
+        self.dataset_dones = []
+
+    def select_action(self, obs):
+        o = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        dist, v = self.ac.get_dist_value(o)
+        a = dist.sample()
+        logp = dist.log_prob(a).sum(axis=-1)
+        return a.squeeze(0).cpu().numpy(), v.item(), logp.item()
+
+    def update(self):
         cfg = self.cfg
-        T = len(rewards)
-        adv = torch.zeros(T, device=device)
-        gae = 0.0
-        for t in reversed(range(T)):
-            mask = 1.0 - dones[t]
-            delta = rewards[t] + cfg.gamma * last_value * mask - values[t]
-            gae = delta + cfg.gamma * cfg.lam * mask * gae
-            adv[t] = gae
-            last_value = values[t]
-        returns = adv + values
-        return adv, returns
+        data = self.buf.get()
+        obs, act, ret, adv, logp_old = data["obs"], data["act"], data["ret"], data["adv"], data["logp"]
+
+        # Policy update
+        for _ in range(cfg.train_pi_iters):
+            dist, _ = self.ac.get_dist_value(obs)
+            logp = dist.log_prob(act).sum(axis=-1)
+            ratio = torch.exp(logp - logp_old)
+
+            clip_adv = torch.clamp(ratio, 1 - cfg.clip_ratio, 1 + cfg.clip_ratio) * adv
+            loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
+
+            self.pi_optimizer.zero_grad()
+            loss_pi.backward()
+            nn.utils.clip_grad_norm_(self.ac.parameters(), 0.5)
+            self.pi_optimizer.step()
+
+        # Value update
+        for _ in range(cfg.train_v_iters):
+            _, v = self.ac.get_dist_value(obs)
+            loss_v = F.mse_loss(v, ret)
+
+            self.v_optimizer.zero_grad()
+            loss_v.backward()
+            nn.utils.clip_grad_norm_(self.ac.parameters(), 0.5)
+            self.v_optimizer.step()
 
     def train(self):
         cfg = self.cfg
+        obs, info = self.env.reset()
+        obs = preprocess_obs(obs)
+        ep_ret = 0.0
+        ep_len = 0
 
-        env = gym.make("CarRacing-v2", continuous=False)
-        env = CarEnvironment(env)
+        total_steps = cfg.total_steps
+        steps_per_epoch = cfg.steps_per_epoch
+        num_epochs = total_steps // steps_per_epoch
 
-        for ep in range(cfg.episodes):
-            state, _ = env.reset()
-            done = False
-            ep_reward = 0.0
+        for epoch in range(num_epochs):
+            for t in range(steps_per_epoch):
+                act, v, logp = self.select_action(obs)
+                next_obs, rew, terminated, truncated, info = self.env.step(act)
+                done = terminated or truncated
 
-            states = []
-            actions = []
-            logps = []
-            rewards = []
-            dones = []
-            values = []
+                # store in PPO buffer
+                self.buf.store(obs, act, rew, done, v, logp)
 
-            t = 0
-            while not done and t < cfg.horizon:
-                action, logp = self.select_action(state)
-                next_state, reward, terminated, truncated, info = env.step(action)
-                done_flag = terminated or truncated
+                # also store in dataset buffers
+                self.dataset_obs.append(obs.copy())
+                self.dataset_actions.append(act.copy())
+                self.dataset_rewards.append(rew)
+                self.dataset_dones.append(float(done))
 
-                # store
-                states.append(state)
-                actions.append(action)
-                logps.append(logp)
-                rewards.append(reward)
-                dones.append(float(done_flag))
+                ep_ret += rew
+                ep_len += 1
+                obs = preprocess_obs(next_obs)
 
-                # value of current state
-                with torch.no_grad():
-                    v = self.critic(
-                        torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-                    ).item()
-                values.append(v)
+                timeout = ep_len == cfg.max_ep_len
+                terminal = done or timeout
+                epoch_ended = (t == steps_per_epoch - 1)
 
-                state = next_state
-                ep_reward += reward
-                done = done_flag
-                t += 1
+                if terminal or epoch_ended:
+                    if epoch_ended and not terminal:
+                        # bootstrap value if epoch ended but episode not done
+                        with torch.no_grad():
+                            o_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                            _, v = self.ac.get_dist_value(o_t)
+                            last_val = v.item()
+                        self.buf.finish_path(last_val)
+                    else:
+                        self.buf.finish_path(last_val=0.0)
 
-            # bootstrap value
-            with torch.no_grad():
-                if done:
-                    last_value = 0.0
-                else:
-                    last_value = self.critic(
-                        torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-                    ).item()
+                    if terminal:
+                        print(f"Epoch {epoch+1}, episode return = {ep_ret:.2f}, len = {ep_len}")
+                        obs, info = self.env.reset()
+                        obs = preprocess_obs(obs)
+                        ep_ret = 0.0
+                        ep_len = 0
 
-            states_t = torch.tensor(np.array(states), dtype=torch.float32, device=device)
-            actions_t = torch.tensor(actions, dtype=torch.long, device=device)
-            old_logp_t = torch.tensor(logps, dtype=torch.float32, device=device)
-            rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
-            dones_t = torch.tensor(dones, dtype=torch.float32, device=device)
-            values_t = torch.tensor(values, dtype=torch.float32, device=device)
+            # PPO update at end of epoch
+            self.update()
 
-            adv_t, ret_t = self.compute_gae(rewards_t, dones_t, values_t, last_value)
-            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+        self.env.close()
 
-            # PPO updates
-            n_samples = states_t.size(0)
-            for _ in range(cfg.n_updates):
-                idxs = np.random.permutation(n_samples)
-                for start in range(0, n_samples, cfg.batch_size):
-                    end = start + cfg.batch_size
-                    mb_idx = idxs[start:end]
+    def save_dataset(self, path="carracing_ppo_dataset.npz"):
+        obs = np.stack(self.dataset_obs, axis=0)         # (N,4,84,84)
+        actions = np.stack(self.dataset_actions, axis=0) # (N,3)
+        rewards = np.array(self.dataset_rewards, dtype=np.float32)
+        dones = np.array(self.dataset_dones, dtype=np.float32)
 
-                    mb_states = states_t[mb_idx]
-                    mb_actions = actions_t[mb_idx]
-                    mb_old_logp = old_logp_t[mb_idx]
-                    mb_adv = adv_t[mb_idx]
-                    mb_ret = ret_t[mb_idx]
-
-                    logp, entropy, values_pred = self.evaluate_actions(mb_states, mb_actions)
-                    ratio = torch.exp(logp - mb_old_logp)
-
-                    surr1 = ratio * mb_adv
-                    surr2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * mb_adv
-                    actor_loss = -torch.min(surr1, surr2).mean()
-
-                    critic_loss = F.mse_loss(values_pred, mb_ret)
-
-                    loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy.mean()
-
-                    self.actor_optim.zero_grad()
-                    self.critic_optim.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-                    nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-                    self.actor_optim.step()
-                    self.critic_optim.step()
-
-            self.total_rewards.append(ep_reward)
-            print(f"[PPO] Episode {ep+1}/{cfg.episodes}, return = {ep_reward:.2f}")
-
-        env.close()
-        torch.save(self.actor.state_dict(), cfg.save_path)
-        print(f"Saved PPO expert actor to {cfg.save_path}")
+        np.savez_compressed(
+            path,
+            obs=obs,
+            actions=actions,
+            rewards=rewards,
+            dones=dones,
+        )
+        print(f"Saved dataset to {path} with {obs.shape[0]} transitions")
 
 
-# -------------------------
-# Expert wrapper for DAgger
-# -------------------------
+def main():
+    cfg = PPOConfig(
+        total_steps=200_000,       # increase if you want a better expert
+        steps_per_epoch=2048,
+        gamma=0.99,
+        lam=0.95,
+        clip_ratio=0.2,
+        pi_lr=3e-4,
+        v_lr=1e-3,
+        train_pi_iters=80,
+        train_v_iters=80,
+        max_ep_len=1000,
+    )
 
-# -------------------------
-# Expert wrapper for DAgger
-# -------------------------
-
-DISCRETE_TO_CONTINUOUS = [
-    np.array([0.0, 0.0, 0.0], dtype=np.float32),   # do nothing
-    np.array([-1.0, 0.0, 0.0], dtype=np.float32),  # left
-    np.array([+1.0, 0.0, 0.0], dtype=np.float32),  # right
-    np.array([0.0, 1.0, 0.0], dtype=np.float32),   # gas
-    np.array([0.0, 0.0, 0.8], dtype=np.float32),   # brake
-]
-
-
-class PPOExpertPolicy:
-    """
-    Wrapper to use the trained discrete PPO actor as an expert
-    in a continuous CarRacing-v2 environment with stacked frames.
-
-    Expected obs from dagger_carracing:
-      - raw obs (84,84,4) uint8, OR
-      - preprocessed (4,84,84) float32 in [0,1]
-    """
-
-    def __init__(self, checkpoint_path: str, device_str: str = None):
-        self.device = torch.device(device_str) if device_str is not None else device
-        self.actor = Actor(in_channels=4, out_dim=len(DISCRETE_TO_CONTINUOUS)).to(self.device)
-
-        # Safe-ish load (you can add weights_only=True if your torch version supports it)
-        state_dict = torch.load(checkpoint_path, map_location=self.device)
-        self.actor.load_state_dict(state_dict)
-        self.actor.eval()
-
-    def _ensure_preprocessed(self, obs) -> np.ndarray:
-        """
-        Normalize obs into shape (4, 84, 84), float32 in [0, 1].
-
-        Handles:
-        - (84, 84, 4)   from H,W,stack
-        - (4, 84, 84)   already channels-first
-        - (4, 84, 84,1) or (84,84,4,1) with extra singleton channel
-        - (84, 84, 1)   single grayscale frame -> tile to 4
-        """
-        arr = np.array(obs)
-
-        # Squeeze extra singleton dims if present, e.g. (4,84,84,1) -> (4,84,84)
-        # or (1,84,84,4) -> (84,84,4)
-        while arr.ndim > 3 and (arr.shape[0] == 1 or arr.shape[-1] == 1):
-            if arr.shape[-1] == 1:
-                arr = arr.squeeze(-1)
-            elif arr.shape[0] == 1:
-                arr = arr.squeeze(0)
-            else:
-                break
-
-        # Now handle 3D / 2D cases
-        if arr.ndim == 3:
-            # Case (H, W, 4): last dim is stack
-            if arr.shape[-1] == 4:
-                arr = arr.astype(np.float32) / 255.0
-                arr = np.transpose(arr, (2, 0, 1))  # -> (4, H, W)
-
-            # Case (4, H, W): already stacked channels-first
-            elif arr.shape[0] == 4:
-                arr = arr.astype(np.float32)
-
-            # Case (H, W, 1): single grayscale frame -> tile to 4
-            elif arr.shape[-1] == 1:
-                img = arr[..., 0].astype(np.float32) / 255.0
-                arr = np.tile(img[None, ...], (4, 1, 1))
-
-            else:
-                # Fallback: treat as single frame (H, W)
-                img = arr.astype(np.float32) / 255.0
-                arr = np.tile(img[None, ...], (4, 1, 1))
-
-        elif arr.ndim == 2:
-            # Single grayscale frame (H, W) -> tile to 4
-            img = arr.astype(np.float32) / 255.0
-            arr = np.tile(img[None, ...], (4, 1, 1))
-
-        else:
-            raise ValueError(f"Unexpected obs shape in PPOExpertPolicy: {arr.shape}")
-
-        return arr
-
-    def get_action(self, obs) -> np.ndarray:
-        """
-        obs: state from DAgger env (either stacked frames or raw).
-        Returns continuous action [steer, gas, brake].
-        """
-        s = self._ensure_preprocessed(obs)                     # (4,84,84)
-        s_t = torch.tensor(s, dtype=torch.float32, device=self.device).unsqueeze(0)  # (1,4,84,84)
-        with torch.no_grad():
-            logits = self.actor(s_t)
-            probs = torch.softmax(logits, dim=-1)
-            # Greedy action for expert
-            action_idx = torch.argmax(probs, dim=-1).item()
-        return DISCRETE_TO_CONTINUOUS[action_idx].copy()
+    agent = PPOAgent(cfg)
+    agent.train()
+    agent.save_dataset("carracing_ppo_dataset.npz")
 
 
 if __name__ == "__main__":
-    cfg = PPOConfig()
-    agent = PPOAgent(cfg)
-    agent.train()
-
+    main()

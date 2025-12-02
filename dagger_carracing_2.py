@@ -1,22 +1,31 @@
 """
-dagger_carracing.py
+DAgger with offline PPO + diffusion expert for CarRacing-v2.
 
-Improved DAgger loop on CarRacing-v2.
+Pipeline:
+  - Offline PPO expert (ppo.py) produced:
+        carracing_ppo_strong_dataset.npz
+    containing:
+        obs: (N, 4, 96, 96)  float32 in [0,1]
+        actions: (N, 3)
 
-- Student: CNN policy mapping stacked frames (4 x 84 x 84) -> [steer, gas, brake]
-- Expert: placeholder (currently random). Replace with PPO / diffusion expert.
-- Features:
-  * Warm-start BC on pure expert rollouts
-  * Aggregated dataset across DAgger iterations
-  * Correct CarRacing action scaling:
-        steer in [-1, 1], gas/brake in [0, 1]
+  - Diffusion training + generation produced:
+        data/generated_carracing/states.npy  (M, 4*96*96) or (M, state_dim)
+        data/generated_carracing/actions.npy (M, 3)
+
+  - This script:
+        * builds an OfflineExpert from PPO + diffusion data
+        * seeds an imitation dataset with offline samples
+        * runs DAgger:
+            - student policy interacts with env
+            - offline expert labels each visited state (nearest neighbor)
+            - aggregate into dataset
+            - BC train student on aggregated dataset
 
 Run:
-    conda activate drl-diffdist
-    python dagger_carracing.py
+    python dagger_carracing_2.py
 """
 
-import random
+import os
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -26,43 +35,48 @@ import torch.nn as nn
 import torch.nn.functional as F
 from gymnasium.wrappers import GrayScaleObservation, ResizeObservation, FrameStack
 
-from ppo_expert import PPOExpertPolicy
+# --------------------------------------------------
+# Paths for offline data
+# --------------------------------------------------
+
+PPO_NPZ_PATH = "carracing_ppo_strong_dataset.npz"   # from ppo.py
+DIFFUSION_DIR = "data/generated_carracing"          # from generate_synthetic_carracing.py
 
 
-# -----------------------------
-#  Env and preprocessing
-# -----------------------------
+# --------------------------------------------------
+# Env and preprocessing (96x96, 4-frame stack)
+# --------------------------------------------------
 
 def make_env(render_mode=None):
     """
     Creates CarRacing-v2 env with:
       - grayscale
-      - 84x84 resize
+      - 96x96 resize
       - frame stack (k=4)
-    Observation after wrappers is (84, 84, 4) uint8.
-    We convert to (4, 84, 84) float32 in [0,1] before feeding to the net.
+    Observation after wrappers is (96,96,4) uint8.
+    We convert to (4,96,96) float32 in [0,1] before feeding to the net.
     """
     env = gym.make("CarRacing-v2", continuous=True, render_mode=render_mode)
     env = GrayScaleObservation(env, keep_dim=True)  # (H, W, 1)
-    env = ResizeObservation(env, 84)               # (84, 84, 1)
-    env = FrameStack(env, num_stack=4)             # (84, 84, 4)
+    env = ResizeObservation(env, 96)               # (96, 96, 1)
+    env = FrameStack(env, num_stack=4)             # (96, 96, 4)
     return env
 
 
 def preprocess_obs(obs):
     """
-    Convert env observation into shape (4, 84, 84) float32 in [0,1].
+    Convert env observation into shape (4, 96, 96) float32 in [0,1].
 
     Handles:
-    - (84, 84, 4)   from FrameStack (H,W,stack)
-    - (4, 84, 84)   already channels-first
-    - (4, 84, 84,1) or (1,84,84,4) etc. with extra singleton dims
-    - (84, 84, 1)   single grayscale frame -> tile to 4
-    - (84, 84)      single grayscale frame -> tile to 4
+    - (96, 96, 4)   from FrameStack (H,W,stack)
+    - (4, 96, 96)   already channels-first
+    - (4, 96, 96,1) or (1,96,96,4) etc. with extra singleton dims
+    - (96, 96, 1)   single grayscale frame -> tile to 4
+    - (96, 96)      single grayscale frame -> tile to 4
     """
     arr = np.array(obs)
 
-    # Squeeze extra singleton dims like (4,84,84,1) -> (4,84,84), or (1,84,84,4) -> (84,84,4)
+    # Squeeze extra singleton dims like (4,96,96,1) -> (4,96,96), or (1,96,96,4) -> (96,96,4)
     while arr.ndim > 3 and (arr.shape[0] == 1 or arr.shape[-1] == 1):
         if arr.shape[-1] == 1:
             arr = arr.squeeze(-1)
@@ -99,16 +113,16 @@ def preprocess_obs(obs):
     else:
         raise ValueError(f"Unexpected obs shape in preprocess_obs: {arr.shape}")
 
-    return arr  # (4,84,84)
+    return arr  # (4,96,96)
 
 
-# -----------------------------
-#  Student policy network
-# -----------------------------
+# --------------------------------------------------
+# Student policy (CNN)
+# --------------------------------------------------
 
 class CNNPolicy(nn.Module):
     """
-    Simple CNN policy: input (B, 4, 84, 84) -> actions [steer, gas, brake].
+    Simple CNN policy: input (B, 4, 96, 96) -> actions [steer, gas, brake].
     steer ∈ [-1, 1], gas/brake ∈ [0, 1].
     """
 
@@ -116,22 +130,22 @@ class CNNPolicy(nn.Module):
         super().__init__()
 
         self.conv = nn.Sequential(
-            nn.Conv2d(obs_channels, 32, kernel_size=8, stride=4),  # -> (32, 20, 20)
+            nn.Conv2d(obs_channels, 32, kernel_size=8, stride=4),  # -> (32, 23, 23)
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),            # -> (64, 9, 9)
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),            # -> (64, 10, 10)
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),            # -> (64, 7, 7)
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),            # -> (64, 8, 8)
             nn.ReLU(),
         )
 
         self.fc_body = nn.Sequential(
-            nn.Linear(64 * 7 * 7, 256),
+            nn.Linear(64 * 8 * 8, 256),
             nn.ReLU(),
         )
         self.fc_out = nn.Linear(256, act_dim)
 
     def forward(self, x):
-        # x: (B,4,84,84)
+        # x: (B,4,96,96)
         x = self.conv(x)
         x = x.view(x.size(0), -1)
         x = self.fc_body(x)
@@ -144,46 +158,21 @@ class CNNPolicy(nn.Module):
         return torch.cat([steer, gas, brake], dim=1)
 
 
-# -----------------------------
-#  Expert policy (stub)
-# -----------------------------
-
-class ExpertPolicy:
-    """
-    Placeholder expert: currently random actions.
-    Replace `get_action` with PPO/diffusion policy inference.
-    """
-
-    def __init__(self, action_space):
-        self.action_space = action_space
-
-    def get_action(self, obs):
-        # obs is (4,84,84) float32 or raw (84,84,4) from env.
-        # For now, just use random actions in env's range.
-        # Replace this with:
-        #   1) preprocess_obs(obs) to tensor
-        #   2) pass through expert model (PPO, diffusion, etc.)
-        low  = self.action_space.low
-        high = self.action_space.high
-        a = np.random.uniform(low, high).astype(np.float32)
-        return a
-
-
-# -----------------------------
-#  Imitation dataset
-# -----------------------------
+# --------------------------------------------------
+# Imitation dataset
+# --------------------------------------------------
 
 class ImitationDataset:
     def __init__(self):
-        self.obs = []   # list of np.array (4,84,84)
+        self.obs = []   # list of np.array (4,96,96)
         self.acts = []  # list of np.array (3,)
 
     def add(self, obs, act):
         """
-        obs: raw env obs (any weird shape) -> we standardize to (4,84,84)
+        obs: raw env obs or (4,96,96) -> standardized to (4,96,96)
         act: np.array([steer, gas, brake])
         """
-        o = preprocess_obs(obs)  # <--- always go through our robust function
+        o = preprocess_obs(obs)  # robust conversion
         a = np.array(act, dtype=np.float32)
         self.obs.append(o)
         self.acts.append(a)
@@ -193,7 +182,7 @@ class ImitationDataset:
 
     def sample_batch(self, batch_size, device="cpu"):
         idxs = np.random.randint(0, len(self.obs), size=batch_size)
-        obs_batch = np.stack([self.obs[i] for i in idxs], axis=0)   # (B,4,84,84)
+        obs_batch = np.stack([self.obs[i] for i in idxs], axis=0)   # (B,4,96,96)
         act_batch = np.stack([self.acts[i] for i in idxs], axis=0)  # (B,3)
 
         obs_t = torch.tensor(obs_batch, dtype=torch.float32, device=device)
@@ -201,39 +190,120 @@ class ImitationDataset:
         return obs_t, act_t
 
 
-# -----------------------------
-#  Data collection routines
-# -----------------------------
+# --------------------------------------------------
+# Offline Expert (PPO + diffusion) via nearest neighbor
+# --------------------------------------------------
 
-def collect_pure_expert_data(env, expert, dataset, num_episodes=5):
+class OfflineExpert:
     """
-    Collect D0: trajectories where the expert controls the env.
+    Offline expert backed by PPO + diffusion datasets.
+
+    - Loads PPO dataset from carracing_ppo_strong_dataset.npz
+    - Optionally loads diffusion synthetic dataset from data/generated_carracing
+    - Stores all states as flattened vectors (4*96*96)
+    - get_action(obs) -> nearest neighbor action in L2 sense
     """
-    for ep in range(num_episodes):
-        obs, info = env.reset()
-        done = False
-        ep_ret = 0.0
 
-        while not done:
-            # Convert raw obs (84,84,4) to (4,84,84) and call expert.
-            expert_action = expert.get_action(obs)
-            next_obs, reward, terminated, truncated, info = env.step(expert_action)
-            done = terminated or truncated
-            ep_ret += reward
+    def __init__(self,
+                 ppo_npz_path: str,
+                 diffusion_dir: str | None = None,
+                 img_shape=(4, 96, 96)):
+        self.img_shape = img_shape
+        C, H, W = img_shape
+        self.state_dim = C * H * W
 
-            dataset.add(obs, expert_action)
-            obs = next_obs
+        all_states = []
+        all_actions = []
 
-        print(f"[Expert] Episode {ep+1}/{num_episodes}, return = {ep_ret:.2f}")
+        # 1) Load PPO expert dataset
+        if not os.path.exists(ppo_npz_path):
+            raise FileNotFoundError(f"PPO dataset npz not found at {ppo_npz_path}")
+        ppo_data = np.load(ppo_npz_path)
+        ppo_obs = ppo_data["obs"]      # (N, 4, 96, 96) float32 in [0,1]
+        ppo_act = ppo_data["actions"]  # (N, 3)
+
+        ppo_obs = ppo_obs.astype(np.float32)
+        ppo_act = ppo_act.astype(np.float32)
+
+        N = ppo_obs.shape[0]
+        ppo_flat = ppo_obs.reshape(N, -1)  # (N, state_dim)
+
+        all_states.append(ppo_flat)
+        all_actions.append(ppo_act)
+        print(f"[OfflineExpert] Loaded PPO dataset: {ppo_npz_path}, N={N}")
+
+        # 2) Optionally load diffusion synthetic dataset
+        if diffusion_dir is not None:
+            states_path = os.path.join(diffusion_dir, "states.npy")
+            actions_path = os.path.join(diffusion_dir, "actions.npy")
+            if os.path.exists(states_path) and os.path.exists(actions_path):
+                diff_states = np.load(states_path)
+                diff_actions = np.load(actions_path)
+                # diff_states: (M, state_dim) or (num_traj, T, state_dim)
+                if diff_states.ndim == 3:
+                    num_traj, T, state_dim = diff_states.shape
+                    diff_states = diff_states.reshape(num_traj * T, state_dim)
+                    diff_actions = diff_actions.reshape(num_traj * T, diff_actions.shape[-1])
+                elif diff_states.ndim == 2:
+                    state_dim = diff_states.shape[-1]
+                else:
+                    raise ValueError(f"[OfflineExpert] Unexpected diffusion states shape: {diff_states.shape}")
+
+                if state_dim != self.state_dim:
+                    raise ValueError(
+                        f"[OfflineExpert] Diffusion state_dim {state_dim} != {self.state_dim}. "
+                        f"Check image resolution / flattening."
+                    )
+
+                # filter zero rows (if any padding)
+                row_is_zero = np.all(np.isclose(diff_states, 0.0), axis=1)
+                mask = ~row_is_zero
+
+                diff_states = diff_states[mask].astype(np.float32)
+                diff_actions = diff_actions[mask].astype(np.float32)
+
+                all_states.append(diff_states)
+                all_actions.append(diff_actions)
+                print(f"[OfflineExpert] Loaded diffusion dataset: {states_path}, M={diff_states.shape[0]}")
+            else:
+                print(f"[OfflineExpert] No diffusion data found in {diffusion_dir}, using PPO only.")
+
+        # 3) Concatenate
+        self.states = np.concatenate(all_states, axis=0)  # (K, state_dim)
+        self.actions = np.concatenate(all_actions, axis=0)  # (K, 3)
+        self.num_samples = self.states.shape[0]
+        print(f"[OfflineExpert] Total offline samples: {self.num_samples}")
+
+    def get_action(self, obs):
+        """
+        obs: raw env obs or (4,96,96) array
+        Returns nearest-neighbor action from offline dataset.
+        """
+        obs_proc = preprocess_obs(obs)  # (4,96,96) float32
+        s_flat = obs_proc.reshape(-1).astype(np.float32)  # (state_dim,)
+
+        # brute-force nearest neighbor (can be optimized later)
+        diffs = self.states - s_flat[None, :]
+        dists = np.sum(diffs * diffs, axis=1)
+        idx = int(np.argmin(dists))
+        return self.actions[idx].copy()
 
 
-def collect_dagger_data(env, student, expert, dataset, num_episodes=5,
-                        device="cpu", beta=None):
+# --------------------------------------------------
+# Data collection routines (DAgger)
+# --------------------------------------------------
+
+def collect_dagger_data(env,
+                        student: CNNPolicy,
+                        expert: OfflineExpert,
+                        dataset: ImitationDataset,
+                        num_episodes: int,
+                        device: str = "cpu"):
     """
     DAgger rollout:
-      - Student chooses action
-      - Expert labels the state with its action
-      - Optionally execute a mixture of expert/student actions (beta)
+      - Student chooses action to step the environment
+      - Offline expert labels the same state with its action (via nearest neighbor)
+      - Label is stored in dataset
     """
     student.eval()
 
@@ -243,44 +313,41 @@ def collect_dagger_data(env, student, expert, dataset, num_episodes=5,
         ep_ret = 0.0
 
         while not done:
-            # Preprocess for student
+            # Student action
             obs_proc = preprocess_obs(obs)
             obs_tensor = torch.tensor(
                 obs_proc, dtype=torch.float32, device=device
-            ).unsqueeze(0)  # [1,4,84,84]
+            ).unsqueeze(0)  # [1,4,96,96]
 
             with torch.no_grad():
                 student_action = student(obs_tensor).cpu().numpy()[0]
 
-            expert_action = expert.get_action(obs)
+            # Offline expert label
+            expert_action = expert.get_action(obs_proc)
 
-            # Execution policy:
-            # if beta is not None:
-            #     if np.random.rand() < beta:
-            #         env_action = expert_action
-            #     else:
-            #         env_action = student_action
-            # else:
-            #     env_action = student_action
-            env_action = student_action  # pure DAgger execution with student
-
-            next_obs, reward, terminated, truncated, info = env.step(env_action)
+            # Step environment with student action
+            next_obs, reward, terminated, truncated, info = env.step(student_action)
             done = terminated or truncated
             ep_ret += reward
 
-            # Always label with expert action
-            dataset.add(obs, expert_action)
+            # Store expert label
+            dataset.add(obs_proc, expert_action)
 
             obs = next_obs
 
         print(f"[DAgger] Episode {ep+1}/{num_episodes}, return = {ep_ret:.2f}")
 
 
-# -----------------------------
-#  Training & evaluation
-# -----------------------------
+# --------------------------------------------------
+# BC training + evaluation
+# --------------------------------------------------
 
-def bc_train_epoch(student, dataset, optimizer, loss_fn, batch_size, device="cpu"):
+def bc_train_epoch(student,
+                   dataset: ImitationDataset,
+                   optimizer,
+                   loss_fn,
+                   batch_size: int,
+                   device: str = "cpu"):
     student.train()
     if len(dataset) == 0:
         return 0.0
@@ -303,7 +370,10 @@ def bc_train_epoch(student, dataset, optimizer, loss_fn, batch_size, device="cpu
     return total_loss / steps
 
 
-def evaluate_policy(env, policy, episodes=5, device="cpu"):
+def evaluate_policy(env,
+                    policy: CNNPolicy,
+                    episodes: int,
+                    device: str = "cpu"):
     policy.eval()
     returns = []
     for ep in range(episodes):
@@ -313,6 +383,8 @@ def evaluate_policy(env, policy, episodes=5, device="cpu"):
 
         while not done:
             obs_proc = preprocess_obs(obs)
+
+
             obs_tensor = torch.tensor(
                 obs_proc, dtype=torch.float32, device=device
             ).unsqueeze(0)
@@ -327,61 +399,111 @@ def evaluate_policy(env, policy, episodes=5, device="cpu"):
     return float(np.mean(returns))
 
 
+# --------------------------------------------------
+# DAgger config + training loop
+# --------------------------------------------------
+
 @dataclass
 class DAggerConfig:
     num_iterations: int = 5
-    expert_init_episodes: int = 5
     dagger_episodes_per_iter: int = 3
     batch_size: int = 64
     bc_epochs_init: int = 5
     bc_epochs_per_iter: int = 3
+    seed_max_samples: int = 50000
+    eval_episodes: int = 3
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def seed_dataset_with_offline_data(dataset: ImitationDataset,
+                                   expert: OfflineExpert,
+                                   max_samples: int = 50000):
+    """
+    Seed imitation dataset with a subset of offline PPO + diffusion samples.
+    """
+    N = expert.num_samples
+    idxs = np.arange(N)
+    if N > max_samples:
+        idxs = np.random.choice(N, size=max_samples, replace=False)
+
+    C, H, W = expert.img_shape
+    added = 0
+    for idx in idxs:
+        s_flat = expert.states[idx]          # (state_dim,)
+        a = expert.actions[idx]              # (3,)
+        s_img = s_flat.reshape(C, H, W)
+        dataset.add(s_img, a)
+        added += 1
+
+    print(f"[Seed] Added {added} offline samples into imitation dataset.")
 
 
 def train_dagger(cfg: DAggerConfig):
     device = cfg.device
-    print(f"Using device: {device}")
+    print(f"[DAgger] Using device: {device}")
 
     env = make_env(render_mode=None)
-    action_space = env.action_space
 
     student = CNNPolicy().to(device)
-    expert = PPOExpertPolicy("ppo_discrete_carracing.pt", device_str=device)
+
+    # from train_student import StudentMLP
+
+    # # Load offline-distilled student
+    # student = StudentMLP(
+    #     state_dim=36864,
+    #     act_dim=3,
+    #     hidden_dim=256,
+    #     num_hidden_layers=2
+    # ).to(device)
+
+    # student.load_state_dict(torch.load(
+    #     "/home/ruiyangz/Desktop/10703Project/10703DeepRL_Project/results/student_baseline/student_baseline_model.pt",
+    #     map_location=device
+    # ))
+
+
+
+    # Offline expert from PPO + diffusion
+    expert = OfflineExpert(
+        ppo_npz_path=PPO_NPZ_PATH,
+        diffusion_dir=DIFFUSION_DIR,
+        img_shape=(4, 96, 96),
+    )
+
     dataset = ImitationDataset()
+
+    # 0) Seed dataset with offline PPO + diffusion samples
+    seed_dataset_with_offline_data(dataset, expert, max_samples=cfg.seed_max_samples)
+    print(f"[DAgger] Dataset size after offline seed = {len(dataset)}")
 
     loss_fn = nn.MSELoss()
     optimizer = torch.optim.Adam(student.parameters(), lr=1e-4)
 
-    # 1) Pure expert dataset D0 + warm-start BC
-    print("Collecting initial expert-only dataset...")
-    collect_pure_expert_data(env, expert, dataset, num_episodes=cfg.expert_init_episodes)
-    print(f"Initial dataset size: {len(dataset)}")
-
+    # 1) Warm-start BC training on offline data
     if len(dataset) >= cfg.batch_size:
-        print("Warm-start BC training...")
+        print("[DAgger] Warm-start BC training on offline dataset...")
         for epoch in range(cfg.bc_epochs_init):
             avg_loss = bc_train_epoch(student, dataset, optimizer, loss_fn,
                                       cfg.batch_size, device=device)
             print(f"[Warm BC] Epoch {epoch+1}/{cfg.bc_epochs_init}, loss = {avg_loss:.4f}")
 
-        avg_return = evaluate_policy(env, student, episodes=3, device=device)
-        print(f"After warm-start BC, avg return = {avg_return:.2f}")
+        avg_return = evaluate_policy(env, student, episodes=cfg.eval_episodes, device=device)
+        print(f"[DAgger] After warm-start BC, avg return = {avg_return:.2f}")
 
-    # 2) DAgger iterations
+    # 2) DAgger iterations: interactive student rollouts + offline expert labels
     for it in range(cfg.num_iterations):
         print(f"\n=== DAgger iteration {it+1}/{cfg.num_iterations} ===")
 
-        # Optional beta schedule (uncomment if you want mixed control)
-        # beta = max(0.1, 1.0 - it / cfg.num_iterations)
-        beta = None
-
+        # Collect new data under student policy, labeled by offline expert
         collect_dagger_data(
-            env, student, expert, dataset,
+            env=env,
+            student=student,
+            expert=expert,
+            dataset=dataset,
             num_episodes=cfg.dagger_episodes_per_iter,
             device=device,
-            beta=beta,
         )
-        print(f"Dataset size after iteration {it+1}: {len(dataset)}")
+        print(f"[DAgger] Dataset size after iteration {it+1}: {len(dataset)}")
 
         # BC on aggregated dataset
         for epoch in range(cfg.bc_epochs_per_iter):
@@ -390,21 +512,22 @@ def train_dagger(cfg: DAggerConfig):
             print(f"[DAgger BC] Iter {it+1}, epoch {epoch+1}/{cfg.bc_epochs_per_iter}, "
                   f"loss = {avg_loss:.4f}")
 
-        avg_return = evaluate_policy(env, student, episodes=3, device=device)
+        avg_return = evaluate_policy(env, student, episodes=cfg.eval_episodes, device=device)
         print(f"[Eval] After DAgger iter {it+1}, avg return = {avg_return:.2f}")
 
     env.close()
-    torch.save(student.state_dict(), "student_dagger_carracing.pt")
-    print("\nTraining finished. Saved student to student_dagger_carracing.pt")
+    torch.save(student.state_dict(), "student_dagger_carracing_offline_expert.pt")
+    print("\n[DAgger] Training finished. Saved student to student_dagger_carracing_offline_expert.pt")
 
 
 if __name__ == "__main__":
     cfg = DAggerConfig(
         num_iterations=5,
-        expert_init_episodes=5,
         dagger_episodes_per_iter=3,
         batch_size=64,
         bc_epochs_init=5,
         bc_epochs_per_iter=3,
+        seed_max_samples=50000,
+        eval_episodes=3,
     )
     train_dagger(cfg)
