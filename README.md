@@ -12,6 +12,19 @@
 ├── 10703DeepRL_Project-Lucas/         
 ├── 10703DeepRL_Project-Tianyun/       
 └── data/                              # Generated datasets
+
+
+  1. f1tenth_ppo.py - PPO expert training adapted for F1TENTH with LiDAR
+  observations
+  2. f1tenth_wrappers.py - Environment wrappers for LiDAR processing and
+  action standardization
+  3. convert_f1tenth_expert.py - Converts PPO data to trajectory format
+  4. train_diffusion_f1tenth.py - Diffusion model training on F1TENTH
+  trajectories
+  5. generate_synthetic_f1tenth.py - Synthetic data generation using
+  diffusion model
+  6. test_f1tenth_setup.py - Testing and validation script
+  7. README_F1TENTH.md - Comprehensive documentation
 ```
 
 ## Quick Start
