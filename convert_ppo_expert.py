@@ -3,7 +3,7 @@ import numpy as np
 
 def main():
     # 1) Load PPO dataset
-    ppo_path = "carracing_ppo_strong_dataset.npz"  # or strong / fast version
+    ppo_path = "carracing_ppo_dataset_fast.npz"  # or strong / fast version
     data = np.load(ppo_path)
     obs     = data["obs"]      # (N,4,96,96)
     actions = data["actions"]  # (N,3)

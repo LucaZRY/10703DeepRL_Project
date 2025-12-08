@@ -1,7 +1,11 @@
 # ppo_train_praveen.py
-# cite from https://github.com/praveenVnktsh/CarRacingv0-PPO-pytorch
-
-# ppo_train_praveen.py
+# Praveen-style PPO on CarRacing-v2 with 4x96x96 grayscale frames
+# Also saves a dataset: carracing_ppo_dataset_fast.npz
+# Format:
+#   obs:     (N, 4, 96, 96)
+#   actions: (N, 3)
+#   rewards: (N,)
+#   dones:   (N,)
 
 import numpy as np
 import gymnasium as gym
@@ -60,6 +64,15 @@ def train():
     max_episodes = 200
     max_steps = 800
 
+    # ---- dataset buffers ----
+    all_obs = []      # unflattened obs: (4,96,96)
+    all_actions = []  # env actions: (3,)
+    all_rewards = []  # scalar rewards
+    all_dones = []    # bool flags
+
+    # how many episodes to skip before logging (so PPO warms up a bit)
+    warmup_episodes = 50
+
     for ep in range(max_episodes):
         obs, _ = env.reset()
         obs = preprocess_obs(obs)
@@ -75,8 +88,15 @@ def train():
 
             next_obs_proc = preprocess_obs(next_obs)
 
-            # store raw Beta action (a_beta), not env_action
+            # store raw Beta action (a_beta), not env_action, for PPO
             agent.store_transition(obs, a_beta, logp, reward, next_obs_proc)
+
+            # ---- log data for diffusion / DAgger dataset AFTER warmup ----
+            if ep >= warmup_episodes:
+                all_obs.append(obs.copy())                          # (4,96,96)
+                all_actions.append(env_action.astype(np.float32))   # (3,)
+                all_rewards.append(np.float32(reward))
+                all_dones.append(done)
 
             obs = next_obs_proc
             episode_return += reward
@@ -90,6 +110,30 @@ def train():
         print(f"[EP {ep}] return = {episode_return:.1f}")
 
     env.close()
+
+    # ---- save dataset to carracing_ppo_dataset_fast.npz ----
+    if len(all_obs) == 0:
+        print("Warning: no data collected (maybe warmup_episodes too large?).")
+        return
+
+    obs_arr = np.stack(all_obs, axis=0)        # (N, 4, 96, 96)
+    actions = np.vstack(all_actions)           # (N, 3)
+    rewards = np.array(all_rewards)
+    dones = np.array(all_dones, dtype=bool)
+
+    np.savez(
+        "carracing_ppo_dataset_fast.npz",
+        obs=obs_arr,           # what convert_ppo_expert.py expects
+        actions=actions,
+        rewards=rewards,
+        dones=dones,
+    )
+
+    print("Saved carracing_ppo_dataset_fast.npz")
+    print("  obs     :", obs_arr.shape)
+    print("  actions :", actions.shape)
+    print("  rewards :", rewards.shape)
+    print("  dones   :", dones.shape)
 
 
 if __name__ == "__main__":

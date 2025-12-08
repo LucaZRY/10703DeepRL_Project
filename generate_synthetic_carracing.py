@@ -7,7 +7,7 @@ from src.models import PolicyDiffusionTransformer  # same as in train_diffusion.
 
 def main():
     expert_dir = "data/expert_carracing"
-    ckpt_path  = "results/diffusion_expert/carracing_expert_96.pt"  # <- likely this
+    ckpt_path  = "results/diffusion_expert/carracing_expert_96.pt"  
     out_dir    = "data/generated_carracing"
 
     os.makedirs(out_dir, exist_ok=True)
@@ -37,7 +37,7 @@ def main():
         device=device,
         target="diffusion_policy",
     )
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     # 4) Build trainer
