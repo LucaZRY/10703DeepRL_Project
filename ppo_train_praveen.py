@@ -1,4 +1,3 @@
-# ppo_train_praveen.py
 # Praveen-style PPO on CarRacing-v2 with 4x96x96 grayscale frames
 # Also saves a dataset: carracing_ppo_dataset_fast.npz
 # Format:
@@ -75,8 +74,12 @@ def train():
         lr=3e-4,
     )
 
-    max_episodes =1000
-    max_steps = 800
+    max_episodes = 400
+    max_steps = 400
+
+    # ---- model checkpointing config ----
+    save_interval_episodes = 100   # change to 200 if you like
+    best_return = -1e9             # track best single-episode return
 
     # ---- dataset buffers ----
     all_obs = []      # unflattened obs: (4,96,96)
@@ -87,7 +90,7 @@ def train():
     # how many episodes to skip before logging (so PPO warms up a bit)
     warmup_episodes = 100
 
-    # <<< NEW: track per-episode returns >>>
+    # track per-episode returns
     episode_returns = []
 
     for ep in range(max_episodes):
@@ -124,14 +127,25 @@ def train():
             if done:
                 break
 
-        # <<< NEW: record return for this episode >>>
+        # record return for this episode
         episode_returns.append(episode_return)
-
         print(f"[EP {ep}] return = {episode_return:.1f}")
+
+        # ---- Save best model so far (based on this episode return) ----
+        if episode_return > best_return:
+            best_return = episode_return
+            agent.save("ppo_best.pt")
+            print(f"[SAVE] New best model at episode {ep} with return {episode_return:.1f}")
+
+        # ---- Periodic checkpoint for safety ----
+        if (ep + 1) % save_interval_episodes == 0:
+            ckpt_path = f"ppo_checkpoint_ep{ep+1}.pt"
+            agent.save(ckpt_path)
+            print(f"[SAVE] Periodic checkpoint saved to {ckpt_path}")
 
     env.close()
 
-    # ---- NEW: Plot training curve ----
+    # ---- Plot training curve ----
     if len(episode_returns) > 0:
         returns_np = np.array(episode_returns, dtype=np.float32)
         ma_returns = moving_average(returns_np, window=10)
@@ -168,7 +182,7 @@ def train():
         dones=dones,
     )
 
-    print("Saved carracing_ppo_dataset_fast.npz")
+    print("Saved carracing_ppo_dataset_1.npz")
     print("  obs     :", obs_arr.shape)
     print("  actions :", actions.shape)
     print("  rewards :", rewards.shape)

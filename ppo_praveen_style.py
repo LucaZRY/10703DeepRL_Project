@@ -1,5 +1,3 @@
-# ppo_praveen_style.py
-
 import numpy as np
 import torch
 import torch.nn as nn
@@ -56,6 +54,7 @@ class CarRacingNet(nn.Module):
         beta = F.softplus(self.beta_head(x)) + 1.0
 
         return (alpha, beta), v
+
 
 class PPOPraveenStyle:
     """
@@ -141,8 +140,6 @@ class PPOPraveenStyle:
 
         return env_action, float(logp.item()), a_beta_np
 
-
-
     def store_transition(self, s, a_beta, logp, r, s_):
         """
         s, s_: (4,96,96) np.float32
@@ -225,8 +222,25 @@ class PPOPraveenStyle:
 
                 total_loss += loss.item()
 
-
         print(f"[PPO] Loss = {total_loss:.4f}")
 
         # Reset buffer
         self.counter = 0
+
+    # ---------- NEW: save/load methods ----------
+
+    def save(self, path: str):
+        """
+        Save only the network weights. To reload, you must recreate
+        CarRacingNet and PPOPraveenStyle with the same architecture/hparams.
+        """
+        torch.save(self.net.state_dict(), path)
+        print(f"[PPO] Saved model to {path}")
+
+    def load(self, path: str):
+        """
+        Load network weights from a file saved by `save()`.
+        """
+        state_dict = torch.load(path, map_location=self.device)
+        self.net.load_state_dict(state_dict)
+        print(f"[PPO] Loaded model from {path}")
