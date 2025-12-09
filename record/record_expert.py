@@ -35,7 +35,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Load trained PPO expert (discrete→continuous wrapper)
-    expert = PPOExpertPolicy("ppo_discrete_carracing.pt", device_str=device)
+    expert = PPOExpertPolicy("results/diffusion_expert/carracing_expert_96.pt", device_str=device)
 
     # Record one rollout
     record_expert_video(expert, "expert_run.mp4", device=device)

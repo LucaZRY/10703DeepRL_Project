@@ -36,6 +36,13 @@ import torch.nn.functional as F
 from gymnasium.wrappers import GrayScaleObservation, ResizeObservation, FrameStack
 
 # --------------------------------------------------
+# Device
+# --------------------------------------------------
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[DAgger] Global device: {DEVICE}")
+
+# --------------------------------------------------
 # Paths for offline data
 # --------------------------------------------------
 
@@ -180,7 +187,7 @@ class ImitationDataset:
     def __len__(self):
         return len(self.obs)
 
-    def sample_batch(self, batch_size, device="cpu"):
+    def sample_batch(self, batch_size, device=DEVICE):
         idxs = np.random.randint(0, len(self.obs), size=batch_size)
         obs_batch = np.stack([self.obs[i] for i in idxs], axis=0)   # (B,4,96,96)
         act_batch = np.stack([self.acts[i] for i in idxs], axis=0)  # (B,3)
@@ -298,7 +305,7 @@ def collect_dagger_data(env,
                         expert: OfflineExpert,
                         dataset: ImitationDataset,
                         num_episodes: int,
-                        device: str = "cpu"):
+                        device: str = DEVICE):
     """
     DAgger rollout:
       - Student chooses action to step the environment
@@ -347,7 +354,7 @@ def bc_train_epoch(student,
                    optimizer,
                    loss_fn,
                    batch_size: int,
-                   device: str = "cpu"):
+                   device: str = DEVICE):
     student.train()
     if len(dataset) == 0:
         return 0.0
@@ -373,7 +380,7 @@ def bc_train_epoch(student,
 def evaluate_policy(env,
                     policy: CNNPolicy,
                     episodes: int,
-                    device: str = "cpu"):
+                    device: str = DEVICE):
     policy.eval()
     returns = []
     for ep in range(episodes):
@@ -383,7 +390,6 @@ def evaluate_policy(env,
 
         while not done:
             obs_proc = preprocess_obs(obs)
-
 
             obs_tensor = torch.tensor(
                 obs_proc, dtype=torch.float32, device=device
@@ -412,7 +418,7 @@ class DAggerConfig:
     bc_epochs_per_iter: int = 3
     seed_max_samples: int = 50000
     eval_episodes: int = 3
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = DEVICE
 
 
 def seed_dataset_with_offline_data(dataset: ImitationDataset,
@@ -444,6 +450,7 @@ def train_dagger(cfg: DAggerConfig):
 
     env = make_env(render_mode=None)
 
+    # Student on GPU/CPU
     student = CNNPolicy().to(device)
 
     # from train_student import StudentMLP
@@ -455,15 +462,13 @@ def train_dagger(cfg: DAggerConfig):
     #     hidden_dim=256,
     #     num_hidden_layers=2
     # ).to(device)
-
+    #
     # student.load_state_dict(torch.load(
-    #     "/home/ruiyangz/Desktop/10703Project/10703DeepRL_Project/results/student_baseline/student_baseline_model.pt",
+    #     "/path/to/student_baseline_model.pt",
     #     map_location=device
     # ))
 
-
-
-    # Offline expert from PPO + diffusion
+    # Offline expert from PPO + diffusion (NumPy only, stays on CPU)
     expert = OfflineExpert(
         ppo_npz_path=PPO_NPZ_PATH,
         diffusion_dir=DIFFUSION_DIR,
@@ -483,8 +488,10 @@ def train_dagger(cfg: DAggerConfig):
     if len(dataset) >= cfg.batch_size:
         print("[DAgger] Warm-start BC training on offline dataset...")
         for epoch in range(cfg.bc_epochs_init):
-            avg_loss = bc_train_epoch(student, dataset, optimizer, loss_fn,
-                                      cfg.batch_size, device=device)
+            avg_loss = bc_train_epoch(
+                student, dataset, optimizer, loss_fn,
+                cfg.batch_size, device=device
+            )
             print(f"[Warm BC] Epoch {epoch+1}/{cfg.bc_epochs_init}, loss = {avg_loss:.4f}")
 
         avg_return = evaluate_policy(env, student, episodes=cfg.eval_episodes, device=device)
@@ -507,10 +514,14 @@ def train_dagger(cfg: DAggerConfig):
 
         # BC on aggregated dataset
         for epoch in range(cfg.bc_epochs_per_iter):
-            avg_loss = bc_train_epoch(student, dataset, optimizer, loss_fn,
-                                      cfg.batch_size, device=device)
-            print(f"[DAgger BC] Iter {it+1}, epoch {epoch+1}/{cfg.bc_epochs_per_iter}, "
-                  f"loss = {avg_loss:.4f}")
+            avg_loss = bc_train_epoch(
+                student, dataset, optimizer, loss_fn,
+                cfg.batch_size, device=device
+            )
+            print(
+                f"[DAgger BC] Iter {it+1}, epoch {epoch+1}/{cfg.bc_epochs_per_iter}, "
+                f"loss = {avg_loss:.4f}"
+            )
 
         avg_return = evaluate_policy(env, student, episodes=cfg.eval_episodes, device=device)
         print(f"[Eval] After DAgger iter {it+1}, avg return = {avg_return:.2f}")
@@ -529,5 +540,6 @@ if __name__ == "__main__":
         bc_epochs_per_iter=3,
         seed_max_samples=50000,
         eval_episodes=3,
+        device=DEVICE,  # explicitly pass global device
     )
     train_dagger(cfg)
