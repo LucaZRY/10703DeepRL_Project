@@ -11,6 +11,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium.wrappers import GrayScaleObservation, ResizeObservation, FrameStack
 import torch
+import matplotlib.pyplot as plt  # <<< NEW: for plotting
 
 from ppo_praveen_style import CarRacingNet, PPOPraveenStyle
 
@@ -45,6 +46,19 @@ def preprocess_obs(obs):
     return obs
 
 
+def moving_average(x, window=10):
+    """
+    Simple moving average for smoothing returns.
+    """
+    if len(x) < window:
+        return np.array(x, dtype=np.float32)
+    cumsum = np.cumsum(np.insert(x, 0, 0))
+    ma = (cumsum[window:] - cumsum[:-window]) / float(window)
+    # pad to same length for easier plotting
+    pad = np.full(window - 1, ma[0], dtype=np.float32)
+    return np.concatenate([pad, ma])
+
+
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     env = make_env()
@@ -58,10 +72,10 @@ def train():
         ppo_epoch=4,
         buffer_capacity=2048,
         batch_size=256,
-        lr=1e-3,
+        lr=3e-4,
     )
 
-    max_episodes = 200
+    max_episodes =1000
     max_steps = 800
 
     # ---- dataset buffers ----
@@ -71,7 +85,10 @@ def train():
     all_dones = []    # bool flags
 
     # how many episodes to skip before logging (so PPO warms up a bit)
-    warmup_episodes = 50
+    warmup_episodes = 100
+
+    # <<< NEW: track per-episode returns >>>
+    episode_returns = []
 
     for ep in range(max_episodes):
         obs, _ = env.reset()
@@ -107,9 +124,31 @@ def train():
             if done:
                 break
 
+        # <<< NEW: record return for this episode >>>
+        episode_returns.append(episode_return)
+
         print(f"[EP {ep}] return = {episode_return:.1f}")
 
     env.close()
+
+    # ---- NEW: Plot training curve ----
+    if len(episode_returns) > 0:
+        returns_np = np.array(episode_returns, dtype=np.float32)
+        ma_returns = moving_average(returns_np, window=10)
+
+        plt.figure(figsize=(8, 5))
+        plt.plot(returns_np, label="Episode return")
+        plt.plot(ma_returns, label="Moving avg (window=10)")
+        plt.xlabel("Episode")
+        plt.ylabel("Return")
+        plt.title("PPO Training on CarRacing-v2")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("ppo_training_returns.png")
+        # Uncomment this if you want to see the plot interactively:
+        # plt.show()
+        print("Saved training curve to ppo_training_returns.png")
 
     # ---- save dataset to carracing_ppo_dataset_fast.npz ----
     if len(all_obs) == 0:
@@ -122,7 +161,7 @@ def train():
     dones = np.array(all_dones, dtype=bool)
 
     np.savez(
-        "carracing_ppo_dataset_fast.npz",
+        "carracing_ppo_dataset_1.npz",
         obs=obs_arr,           # what convert_ppo_expert.py expects
         actions=actions,
         rewards=rewards,

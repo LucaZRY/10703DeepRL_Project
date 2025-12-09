@@ -21,46 +21,26 @@ class CarRacingNet(nn.Module):
 
         # Simple CNN encoder – you can make this deeper if needed
         self.conv = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=8, stride=4),  # (32, 23, 23)
+            nn.Conv2d(4, 32, kernel_size=8, stride=4),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),  # (64, 10, 10)
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),  # (64, 8, 8)
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
         )
 
-        conv_out_dim = 64 * 8 * 8
+        self.conv_out_size = 64 * 8 * 8
 
         self.fc_shared = nn.Sequential(
-            nn.Linear(conv_out_dim, 128),
+            nn.Linear(self.conv_out_size, 256), 
             nn.ReLU(),
         )
 
         # Value head
-        self.v_head = nn.Sequential(
-            nn.Linear(128, 100),
-            nn.ReLU(),
-            nn.Linear(100, 1),
-        )
-
-        # Policy head → alpha, beta for each action dim
-        self.alpha_head = nn.Sequential(
-            nn.Linear(128, 100),
-            nn.ReLU(),
-            nn.Linear(100, action_dim),
-        )
-        self.beta_head = nn.Sequential(
-            nn.Linear(128, 100),
-            nn.ReLU(),
-            nn.Linear(100, action_dim),
-        )
-
-        # Optional: initialize weights similar to their style
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                nn.init.constant_(m.bias, 0.1)
-
+        self.v_head = nn.Linear(256, 1)
+        self.alpha_head = nn.Linear(256, action_dim)
+        self.beta_head = nn.Linear(256, action_dim)
+    
     def forward(self, obs):
         """
         obs: (B, 4, 96, 96) float tensor in [0,1] or similar.
@@ -72,11 +52,10 @@ class CarRacingNet(nn.Module):
 
         v = self.v_head(x)
 
-        alpha = self.alpha_head(x) + 1e-4  # ensure > 0
-        beta = self.beta_head(x) + 1e-4
+        alpha = F.softplus(self.alpha_head(x)) + 1.0
+        beta = F.softplus(self.beta_head(x)) + 1.0
 
         return (alpha, beta), v
-
 
 class PPOPraveenStyle:
     """
@@ -100,7 +79,7 @@ class PPOPraveenStyle:
         ppo_epoch=4,
         buffer_capacity=2048,
         batch_size=256,
-        lr=1e-3,
+        lr=3e-4,
     ):
         self.net = net.to(device)
         self.device = device
