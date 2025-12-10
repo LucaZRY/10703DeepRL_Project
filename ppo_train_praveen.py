@@ -69,12 +69,18 @@ def train():
         gamma=0.99,
         clip_param=0.2,
         ppo_epoch=4,
+<<<<<<< HEAD
         # --- ADJUSTED HYPERPARAMETERS ---
         buffer_capacity=8192,  # Increased buffer size for better sampling
+=======
+        # --- ADJUSTED CONFIG ---
+        buffer_capacity=8192,  
+>>>>>>> 682913f9d2c200d765701b41121f8389e6bc1a4c
         batch_size=256,
         lr=3e-4,
     )
 
+<<<<<<< HEAD
     max_episodes = 1500
     # --- ADJUSTED MAX STEPS ---
     max_steps = 1000 # Set to the environment's maximum time limit
@@ -82,6 +88,15 @@ def train():
     # ---- model checkpointing config ----
     save_interval_episodes = 100
     best_return = -1e9
+=======
+    max_episodes = 2000
+    # --- ADJUSTED CONFIG ---
+    max_steps = 1000
+
+    # ---- model checkpointing config ----
+    save_interval_episodes = 100   
+    best_return = -1e9             
+>>>>>>> 682913f9d2c200d765701b41121f8389e6bc1a4c
 
     # ---- dataset buffers ----
     all_obs = []      # unflattened obs: (4,96,96)
@@ -102,11 +117,15 @@ def train():
         episode_return = 0.0
 
         for t in range(max_steps):
-            # --- use the new signature: returns env_action, logp, a_beta ---
+            # --- use the new signature: returns env_action (np.float32 array), logp, a_beta ---
             env_action, logp, a_beta = agent.select_action(obs)
 
+<<<<<<< HEAD
             # --- CRITICAL FIX: Convert NumPy array (float32) to standard Python list (float) ---
             # This prevents the "TypeError: in method 'b2RevoluteJoint___SetMotorSpeed'"
+=======
+            # --- CRITICAL FIX: Convert NumPy array to standard Python list for env.step() ---
+>>>>>>> 682913f9d2c200d765701b41121f8389e6bc1a4c
             action_for_env = env_action.tolist()
 
             next_obs, reward, terminated, truncated, info = env.step(action_for_env)
