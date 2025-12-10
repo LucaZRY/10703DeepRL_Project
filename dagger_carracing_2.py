@@ -46,7 +46,7 @@ print(f"[DAgger] Global device: {DEVICE}")
 # Paths for offline data
 # --------------------------------------------------
 
-PPO_NPZ_PATH = "carracing_ppo_strong_dataset.npz"   # from ppo.py
+PPO_NPZ_PATH = "carracing_dqn_dataset.npz"   # from ppo.py
 DIFFUSION_DIR = "data/generated_carracing"          # from generate_synthetic_carracing.py
 
 
