@@ -27,12 +27,16 @@ class CarRacingNet(nn.Module):
             nn.ReLU(),
         )
 
-        self.conv_out_size = 64 * 8 * 8
+        self.conv_out_size = 64 * 8 * 8  # 4096
 
+        # --- ADJUSTED: Deeper Shared FC Network for richer feature extraction ---
         self.fc_shared = nn.Sequential(
-            nn.Linear(self.conv_out_size, 256), 
+            nn.Linear(self.conv_out_size, 512), 
+            nn.ReLU(),
+            nn.Linear(512, 256),              
             nn.ReLU(),
         )
+        # -----------------------------------------------------------------------
 
         # Value head
         self.v_head = nn.Linear(256, 1)
@@ -76,7 +80,7 @@ class PPOPraveenStyle:
         gamma=0.99,
         clip_param=0.2,
         ppo_epoch=4,
-        buffer_capacity=2048,
+        buffer_capacity=8192, # Adjusted in ppo_train, matching here for consistency
         batch_size=256,
         lr=3e-4,
     ):
@@ -227,7 +231,7 @@ class PPOPraveenStyle:
         # Reset buffer
         self.counter = 0
 
-    # ---------- NEW: save/load methods ----------
+    # ---------- save/load methods ----------
 
     def save(self, path: str):
         """
