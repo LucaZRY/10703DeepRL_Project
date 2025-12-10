@@ -10,7 +10,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium.wrappers import GrayScaleObservation, ResizeObservation, FrameStack
 import torch
-import matplotlib.pyplot as plt  # <<< NEW: for plotting
+import matplotlib.pyplot as plt
 
 from ppo_praveen_style import CarRacingNet, PPOPraveenStyle
 
@@ -69,17 +69,19 @@ def train():
         gamma=0.99,
         clip_param=0.2,
         ppo_epoch=4,
-        buffer_capacity=2048,
+        # --- ADJUSTED CONFIG ---
+        buffer_capacity=8192,  
         batch_size=256,
         lr=3e-4,
     )
 
-    max_episodes = 400
-    max_steps = 400
+    max_episodes = 2000
+    # --- ADJUSTED CONFIG ---
+    max_steps = 1000
 
     # ---- model checkpointing config ----
-    save_interval_episodes = 100   # change to 200 if you like
-    best_return = -1e9             # track best single-episode return
+    save_interval_episodes = 100   
+    best_return = -1e9             
 
     # ---- dataset buffers ----
     all_obs = []      # unflattened obs: (4,96,96)
@@ -100,10 +102,13 @@ def train():
         episode_return = 0.0
 
         for t in range(max_steps):
-            # --- use the new signature: returns env_action, logp, a_beta ---
+            # --- use the new signature: returns env_action (np.float32 array), logp, a_beta ---
             env_action, logp, a_beta = agent.select_action(obs)
 
-            next_obs, reward, terminated, truncated, info = env.step(env_action)
+            # --- CRITICAL FIX: Convert NumPy array to standard Python list for env.step() ---
+            action_for_env = env_action.tolist()
+
+            next_obs, reward, terminated, truncated, info = env.step(action_for_env)
             done = terminated or truncated
 
             next_obs_proc = preprocess_obs(next_obs)
@@ -160,11 +165,9 @@ def train():
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig("ppo_training_returns.png")
-        # Uncomment this if you want to see the plot interactively:
-        # plt.show()
         print("Saved training curve to ppo_training_returns.png")
 
-    # ---- save dataset to carracing_ppo_dataset_fast.npz ----
+    # ---- save dataset to carracing_ppo_dataset_1.npz ----
     if len(all_obs) == 0:
         print("Warning: no data collected (maybe warmup_episodes too large?).")
         return

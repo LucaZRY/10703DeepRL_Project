@@ -27,12 +27,16 @@ class CarRacingNet(nn.Module):
             nn.ReLU(),
         )
 
-        self.conv_out_size = 64 * 8 * 8
+        self.conv_out_size = 64 * 8 * 8  # 4096
 
+        # --- ADJUSTED: Deeper Shared FC Network ---
         self.fc_shared = nn.Sequential(
-            nn.Linear(self.conv_out_size, 256), 
+            nn.Linear(self.conv_out_size, 512), 
+            nn.ReLU(),
+            nn.Linear(512, 256),
             nn.ReLU(),
         )
+        # ------------------------------------------
 
         # Value head
         self.v_head = nn.Linear(256, 1)
@@ -137,6 +141,10 @@ class PPOPraveenStyle:
         gas   = a_beta_np[1]               # [0,1]
         brake = a_beta_np[2]               # [0,1]
         env_action = np.array([steer, gas, brake], dtype=np.float32)
+        
+        # NOTE: env_action is returned as a NumPy array (float32).
+        # It MUST be converted to a list/float before calling env.step() 
+        # in ppo_train_praveen.py to avoid the TypeError.
 
         return env_action, float(logp.item()), a_beta_np
 
@@ -227,7 +235,7 @@ class PPOPraveenStyle:
         # Reset buffer
         self.counter = 0
 
-    # ---------- NEW: save/load methods ----------
+    # ---------- save/load methods ----------
 
     def save(self, path: str):
         """
