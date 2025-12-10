@@ -1,8 +1,8 @@
 """
-Enhanced PPO for CarRacing with Video Recording and Pipeline Integration
+Enhanced PPO for CarRacing Pipeline Integration
 
 Improvements over original PPO:
-- Video recording during training and evaluation
+
 - Better CarRacing-specific optimizations
 - Enhanced monitoring and visualization
 - Improved dataset generation for diffusion pipeline
@@ -31,7 +31,7 @@ try:
 except ImportError:
     SummaryWriter = None
     HAS_TENSORBOARD = False
-    print("⚠️ TensorBoard not available. Install with: pip install tensorboard")
+    print("TensorBoard not available. Install with: pip install tensorboard")
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import matplotlib
