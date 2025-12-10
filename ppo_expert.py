@@ -1,373 +1,364 @@
-"""
-Pure PPO expert for CarRacing-v2 (continuous) + dataset saver.
-
-- Env: CarRacing-v2 with continuous actions [steer, gas, brake]
-- Obs: stacked grayscale frames (4, 84, 84), float32 in [0,1]
-- Outputs: carracing_ppo_dataset.npz
-    - obs: (N, 4, 84, 84)
-    - actions: (N, 3)
-    - rewards: (N,)
-    - dones: (N,)
-"""
-
-import numpy as np
 import gymnasium as gym
-from gymnasium.wrappers import GrayScaleObservation, ResizeObservation, FrameStack
+import matplotlib
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
+from torch.distributions import Categorical
 from torch.optim import Adam
-from dataclasses import dataclass
+import cv2
+import numpy as np
+import random
+import pickle
+import os
+import string
+import glob
 
+# --- Setup ---
+# Set up device (GPU if available)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
+print(f"Using device: {device}")
 
+# Enable interactive mode for matplotlib (prevents blocking)
+plt.ion()
 
-# --------------------------
-# Env + preprocessing
-# --------------------------
+# --- Helper Functions ---
 
-def make_env(render_mode=None):
+def image_preprocessing(img):
     """
-    CarRacing-v2 continuous env with:
-      - grayscale
-      - 84x84
-      - 4-frame stack
+    Resize image to 84x84 and convert to grayscale.
+    Returns normalized float image.
     """
-    env = gym.make("CarRacing-v2", continuous=True, render_mode=render_mode)
-    env = GrayScaleObservation(env, keep_dim=True)  # (H, W, 1)
-    env = ResizeObservation(env, 84)               # (84, 84, 1)
-    env = FrameStack(env, num_stack=4)             # (84, 84, 4)
-    return env
+    img = cv2.resize(img, dsize=(84, 84))
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) / 255.0
+    return img
 
-
-def preprocess_obs(obs):
+def plot_results(rewards):
     """
-    Convert env obs into shape (4, 84, 84) float32 in [0,1].
-    Handles:
-    - (84,84,4) from FrameStack (H,W,stack)
-    - (4,84,84) already channels-first
+    Plots the training rewards and saves the graph to a file.
+    This function is called periodically to update the training curve.
     """
-    arr = np.array(obs)
+    plt.figure(figsize=(10, 5))
+    plt.plot(rewards)
+    plt.title("Training Rewards over Episodes")
+    plt.xlabel("Episode")
+    plt.ylabel("Total Reward")
+    plt.grid(True)
+    
+    # Save the plot to a file
+    plt.savefig("training_curve.png")
+    plt.close() # Close the figure to free memory
+    print("Graph updated: training_curve.png")
 
-    # Squeeze weird singleton dims if any
-    while arr.ndim > 3 and (arr.shape[0] == 1 or arr.shape[-1] == 1):
-        if arr.shape[-1] == 1:
-            arr = arr.squeeze(-1)
-        elif arr.shape[0] == 1:
-            arr = arr.squeeze(0)
-        else:
-            break
+def animate(imgs, video_name, _return=True):
+    """
+    Compiles a list of image frames into a video file (.webm).
+    """
+    if video_name is None:
+        video_name = ''.join(random.choice(string.ascii_letters) for i in range(18)) + '.webm'
+    
+    if len(imgs) == 0:
+        print("No frames to animate.")
+        return
 
-    if arr.ndim == 3:
-        # (H,W,4)
-        if arr.shape[-1] == 4:
-            arr = arr.astype(np.float32) / 255.0
-            arr = np.transpose(arr, (2, 0, 1))  # -> (4,H,W)
-        # (4,H,W)
-        elif arr.shape[0] == 4:
-            arr = arr.astype(np.float32)
-        # (H,W,1) → tile to 4
-        elif arr.shape[-1] == 1:
-            img = arr[..., 0].astype(np.float32) / 255.0
-            arr = np.tile(img[None, ...], (4, 1, 1))
-        else:
-            img = arr.astype(np.float32) / 255.0
-            arr = np.tile(img[None, ...], (4, 1, 1))
-    elif arr.ndim == 2:
-        img = arr.astype(np.float32) / 255.0
-        arr = np.tile(img[None, ...], (4, 1, 1))
-    else:
-        raise ValueError(f"Unexpected obs shape in preprocess_obs: {arr.shape}")
+    height, width, layers = imgs[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*'VP90')
+    video = cv2.VideoWriter(video_name, fourcc, 10, (width, height))
 
-    return arr  # (4,84,84)
+    for img in imgs:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        video.write(img)
+    video.release()
+    print(f"Video saved as {video_name}")
 
+# --- Environment Wrapper ---
 
-# --------------------------
-# PPO network: CNN + Gaussian policy
-# --------------------------
+class CarEnvironment(gym.Wrapper):
+    def __init__(self, env, skip_frames=4, stack_frames=4, no_operation=50, **kwargs):
+        super().__init__(env, **kwargs)
+        self._no_operation = no_operation
+        self._skip_frames = skip_frames
+        self._stack_frames = stack_frames
+        self.stack_state = None
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_channels=4, act_dim=3):
-        super().__init__()
-        self.act_dim = act_dim
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+
+        # Perform no-ops to randomize start
+        for i in range(self._no_operation):
+            observation, reward, terminated, truncated, info = self.env.step(0)
+
+        observation = image_preprocessing(observation)
+        # Stack the initial frame multiple times
+        self.stack_state = np.tile(observation, (self._stack_frames, 1, 1))
+        return self.stack_state, info
+
+    def step(self, action):
+        total_reward = 0
+        for i in range(self._skip_frames):
+            observation, reward, terminated, truncated, info = self.env.step(action)
+            total_reward += reward
+
+            if terminated or truncated:
+                break
+
+        observation = image_preprocessing(observation)
+        # Update stack: drop oldest frame, add newest
+        self.stack_state = np.concatenate((self.stack_state[1:], observation[np.newaxis]), axis=0)
+        return self.stack_state, total_reward, terminated, truncated, info
+
+# --- Neural Networks ---
+
+class Actor(nn.Module):
+    def __init__(self, in_channels, out_channels, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._n_features = 32 * 9 * 9
 
         self.conv = nn.Sequential(
-            nn.Conv2d(obs_channels, 32, kernel_size=8, stride=4),  # -> (32,20,20)
+            nn.Conv2d(in_channels, 16, kernel_size=8, stride=4),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),            # -> (64,9,9)
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),            # -> (64,7,7)
+            nn.Conv2d(16, 32, kernel_size=4, stride=2),
             nn.ReLU(),
         )
 
         self.fc = nn.Sequential(
-            nn.Linear(64 * 7 * 7, 256),
+            nn.Linear(self._n_features, 256),
+            nn.ReLU(),
+            nn.Linear(256, out_channels),
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view((-1, self._n_features))
+        x = self.fc(x)
+        return x
+
+class Critic(nn.Module):
+    def __init__(self, in_channels, out_channels, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._n_features = 32 * 9 * 9
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=4, stride=2),
             nn.ReLU(),
         )
 
-        self.mu_head = nn.Linear(256, act_dim)
-        self.v_head = nn.Linear(256, 1)
-
-        # log_std as a parameter (independent per action dim)
-        self.log_std = nn.Parameter(torch.zeros(act_dim))
+        self.fc = nn.Sequential(
+            nn.Linear(self._n_features, 256),
+            nn.ReLU(),
+            nn.Linear(256, out_channels),
+        )
 
     def forward(self, x):
-        # x: (B,4,84,84)
         x = self.conv(x)
-        x = x.view(x.size(0), -1)
+        x = x.view((-1, self._n_features))
         x = self.fc(x)
-        mu = self.mu_head(x)           # (B,3)
-        v = self.v_head(x).squeeze(-1) # (B,)
-        return mu, v
+        return x
 
-    def get_dist_value(self, x):
-        mu, v = self.forward(x)
-        std = torch.exp(self.log_std)
-        dist = torch.distributions.Normal(mu, std)
-        return dist, v
+# --- PPO Agent ---
 
-
-# --------------------------
-# PPO buffer with GAE
-# --------------------------
-
-class PPOBuffer:
-    def __init__(self, obs_shape, act_dim, size, gamma=0.99, lam=0.95):
-        self.obs_buf = np.zeros((size, *obs_shape), dtype=np.float32)
-        self.act_buf = np.zeros((size, act_dim), dtype=np.float32)
-        self.rew_buf = np.zeros(size, dtype=np.float32)
-        self.done_buf = np.zeros(size, dtype=np.float32)
-        self.val_buf = np.zeros(size, dtype=np.float32)
-        self.logp_buf = np.zeros(size, dtype=np.float32)
-
-        self.adv_buf = np.zeros(size, dtype=np.float32)
-        self.ret_buf = np.zeros(size, dtype=np.float32)
-
+class PPO:
+    def __init__(self, action_dim=5, obs_dim=4, episodes=1500, trajectories=300, 
+                 gamma=0.99, lr_actor=0.0001, lr_critic=0.0001, clip=0.4, 
+                 n_updates=3, lambda_=0.99):
+        self.action_dim = action_dim
+        self.obs_dim = obs_dim
+        self.episodes = episodes
+        self.trajectories = trajectories
         self.gamma = gamma
-        self.lam = lam
-        self.ptr = 0
-        self.path_start = 0
-        self.max_size = size
+        self.lr_actor = lr_actor
+        self.lr_critic = lr_critic
+        self.clip = clip
+        self.n_updates = n_updates
+        self.lambda_ = lambda_
+        self._total_rewards = []
+        
+        self.actor = Actor(obs_dim, action_dim).to(device)
+        self.critic = Critic(obs_dim, 1).to(device)
+        self.actor_optim = Adam(self.actor.parameters(), lr=self.lr_actor)
+        self.critic_optim = Adam(self.critic.parameters(), lr=self.lr_critic)
 
-    def store(self, obs, act, rew, done, val, logp):
-        assert self.ptr < self.max_size
-        self.obs_buf[self.ptr] = obs
-        self.act_buf[self.ptr] = act
-        self.rew_buf[self.ptr] = rew
-        self.done_buf[self.ptr] = done
-        self.val_buf[self.ptr] = val
-        self.logp_buf[self.ptr] = logp
-        self.ptr += 1
-
-    def finish_path(self, last_val=0.0):
+    def get_action(self, obs):
         """
-        Call at end of trajectory or when buffer is full.
-        Uses GAE-Lambda to compute advantage estimates.
+        Feed observation to Actor, sample action from distribution.
         """
-        end = self.ptr
-        rews = np.append(self.rew_buf[self.path_start:end], last_val)
-        vals = np.append(self.val_buf[self.path_start:end], last_val)
+        obs = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        action_probs = self.actor(obs)
+        dist = Categorical(logits=action_probs)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        return action.detach().cpu().numpy(), log_prob.detach()
 
-        gae = 0.0
-        for t in reversed(range(end - self.path_start)):
-            nonterminal = 1.0 - self.done_buf[self.path_start + t]
-            delta = rews[t] + self.gamma * vals[t + 1] * nonterminal - vals[t]
-            gae = delta + self.gamma * self.lam * nonterminal * gae
-            self.adv_buf[self.path_start + t] = gae
-
-        self.ret_buf[self.path_start:end] = self.adv_buf[self.path_start:end] + self.val_buf[self.path_start:end]
-        self.path_start = self.ptr
-
-    def get(self):
+    def collect_trajectories(self):
         """
-        Return all data from the buffer, with advantages normalized.
+        Collect trajectories (observations, rewards, etc.) using current policy.
         """
-        assert self.ptr == self.max_size  # buffer full
-        self.ptr = 0
-        self.path_start = 0
+        batch_obs = []
+        batch_rewards = []
+        batch_log_probs = []
+        batch_actions = []
+        batch_dones = []
+        t = 0
 
-        adv = self.adv_buf
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        # Create env
+        env = gym.make('CarRacing-v2', continuous=False, render_mode='rgb_array')
+        env = CarEnvironment(env)
 
-        data = dict(obs=self.obs_buf,
-                    act=self.act_buf,
-                    ret=self.ret_buf,
-                    adv=adv,
-                    logp=self.logp_buf)
-        return {k: torch.as_tensor(v, dtype=torch.float32, device=device) for k, v in data.items()}
+        while True:
+            obs, _ = env.reset()
 
+            while True:
+                batch_obs.append(obs)
 
-# --------------------------
-# PPO config + agent
-# --------------------------
+                a, log_prob = self.get_action(obs)
+                batch_actions.append(a)
+                batch_log_probs.append(log_prob)
 
-@dataclass
-class PPOConfig:
-    total_steps: int = 200_000        # total environment steps
-    steps_per_epoch: int = 2048       # rollout size
-    gamma: float = 0.99
-    lam: float = 0.95
-    clip_ratio: float = 0.2
-    pi_lr: float = 3e-4
-    v_lr: float = 1e-3
-    train_pi_iters: int = 80
-    train_v_iters: int = 80
-    max_ep_len: int = 1000
+                obs, rew, terminated, truncated, _ = env.step(a.item())
+                batch_rewards.append(rew)
 
+                t += 1
 
-class PPOAgent:
-    def __init__(self, cfg: PPOConfig):
-        self.cfg = cfg
-        self.env = make_env(render_mode=None)
-        obs_shape = (4, 84, 84)
-        act_dim = 3
+                if terminated or truncated or t == self.trajectories:
+                    batch_dones.append(1)
+                    break
+                else:
+                    batch_dones.append(0)
 
-        self.ac = ActorCritic(obs_channels=4, act_dim=act_dim).to(device)
-        self.pi_optimizer = Adam(self.ac.parameters(), lr=cfg.pi_lr)
-        self.v_optimizer = Adam(self.ac.parameters(), lr=cfg.v_lr)
+            if t == self.trajectories:
+                env.close()
+                break
 
-        self.buf = PPOBuffer(
-            obs_shape=obs_shape,
-            act_dim=act_dim,
-            size=cfg.steps_per_epoch,
-            gamma=cfg.gamma,
-            lam=cfg.lam,
-        )
+        self._total_rewards.append(sum(batch_rewards))
 
-        # For saving dataset
-        self.dataset_obs = []
-        self.dataset_actions = []
-        self.dataset_rewards = []
-        self.dataset_dones = []
+        # Convert to tensors
+        batch_obs = np.array(batch_obs)
+        batch_obs = torch.tensor(batch_obs, dtype=torch.float32)
+        batch_rewards = torch.tensor(batch_rewards, dtype=torch.float32)
+        batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float32)
+        batch_actions = torch.tensor(batch_actions, dtype=torch.long)
 
-    def select_action(self, obs):
-        o = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        dist, v = self.ac.get_dist_value(o)
-        a = dist.sample()
-        logp = dist.log_prob(a).sum(axis=-1)
-        return a.squeeze(0).cpu().numpy(), v.item(), logp.item()
+        # Reward Normalization
+        batch_rewards = (batch_rewards - batch_rewards.mean()) / (batch_rewards.std() + 1e-8)
 
-    def update(self):
-        cfg = self.cfg
-        data = self.buf.get()
-        obs, act, ret, adv, logp_old = data["obs"], data["act"], data["ret"], data["adv"], data["logp"]
+        return batch_obs, batch_rewards, batch_log_probs, batch_actions, batch_dones
 
-        # Policy update
-        for _ in range(cfg.train_pi_iters):
-            dist, _ = self.ac.get_dist_value(obs)
-            logp = dist.log_prob(act).sum(axis=-1)
-            ratio = torch.exp(logp - logp_old)
+    def compute_discounted_sum(self, batch_rewards, V, batch_dones):
+        """
+        Computing the discounted reward sum with GAE.
+        """
+        discounted_sum = []
+        gae = 0
+        zero = torch.tensor([0])
+        V = torch.cat((V.cpu(), zero))
 
-            clip_adv = torch.clamp(ratio, 1 - cfg.clip_ratio, 1 + cfg.clip_ratio) * adv
-            loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
+        for i in reversed(range(len(batch_rewards))):
+            delta = batch_rewards[i] + self.gamma * V[i + 1] * (1 - batch_dones[i]) - V[i]
+            gae = delta + self.gamma * self.lambda_ * gae * (1 - batch_dones[i])
+            discounted_sum.insert(0, gae)
 
-            self.pi_optimizer.zero_grad()
-            loss_pi.backward()
-            nn.utils.clip_grad_norm_(self.ac.parameters(), 0.5)
-            self.pi_optimizer.step()
-
-        # Value update
-        for _ in range(cfg.train_v_iters):
-            _, v = self.ac.get_dist_value(obs)
-            loss_v = F.mse_loss(v, ret)
-
-            self.v_optimizer.zero_grad()
-            loss_v.backward()
-            nn.utils.clip_grad_norm_(self.ac.parameters(), 0.5)
-            self.v_optimizer.step()
+        return discounted_sum
 
     def train(self):
-        cfg = self.cfg
-        obs, info = self.env.reset()
-        obs = preprocess_obs(obs)
-        ep_ret = 0.0
-        ep_len = 0
+        """
+        Main Training Loop with Live Plotting
+        """
+        print(f"Starting training for {self.episodes} episodes...")
+        for episode in range(self.episodes):
 
-        total_steps = cfg.total_steps
-        steps_per_epoch = cfg.steps_per_epoch
-        num_epochs = total_steps // steps_per_epoch
+            if episode % 10 == 0:
+                print(f"Episode {episode} | Last Rewards: {self._total_rewards[-5:]}")
 
-        for epoch in range(num_epochs):
-            for t in range(steps_per_epoch):
-                act, v, logp = self.select_action(obs)
-                next_obs, rew, terminated, truncated, info = self.env.step(act)
-                done = terminated or truncated
+            if (1 + episode) % 50 == 0:
+                print(f"Saving Checkpoint: {episode + 1}")
+                torch.save(self.actor.state_dict(), f'actor_weights_{episode + 1}.pth')
+                torch.save(self.critic.state_dict(), f'critic_weights_{episode + 1}.pth')
+                with open('statistics.pkl', 'wb') as f:
+                    pickle.dump((self._total_rewards), f)
+                
+                # --- UPDATE PLOT EVERY 50 EPISODES ---
+                plot_results(self._total_rewards)
+                # -------------------------------------
 
-                # store in PPO buffer
-                self.buf.store(obs, act, rew, done, v, logp)
+            # Collecting the batches with the information
+            batch_obs, batch_rewards, batch_log_probs, batch_actions, batch_dones = self.collect_trajectories()
 
-                # also store in dataset buffers
-                self.dataset_obs.append(obs.copy())
-                self.dataset_actions.append(act.copy())
-                self.dataset_rewards.append(rew)
-                self.dataset_dones.append(float(done))
+            # Compute V values with the critic network in current states
+            V = self.critic(batch_obs.to(device)).squeeze()
 
-                ep_ret += rew
-                ep_len += 1
-                obs = preprocess_obs(next_obs)
+            # Compute the discounted sum
+            discounted_sum = self.compute_discounted_sum(batch_rewards, V, batch_dones)
+            discounted_sum = torch.tensor(discounted_sum, dtype=torch.float32)
 
-                timeout = ep_len == cfg.max_ep_len
-                terminal = done or timeout
-                epoch_ended = (t == steps_per_epoch - 1)
+            # The advantages to maximize
+            advantages = discounted_sum - V.detach().cpu()
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                if terminal or epoch_ended:
-                    if epoch_ended and not terminal:
-                        # bootstrap value if epoch ended but episode not done
-                        with torch.no_grad():
-                            o_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                            _, v = self.ac.get_dist_value(o_t)
-                            last_val = v.item()
-                        self.buf.finish_path(last_val)
-                    else:
-                        self.buf.finish_path(last_val=0.0)
+            # Update the network
+            for update in range(self.n_updates):
+                actions_probs = self.actor(batch_obs.to(device))
+                action_log_probs = actions_probs.gather(1, batch_actions.to(device)).squeeze()
+                ratios = torch.exp(action_log_probs - batch_log_probs.to(device)).cpu()
 
-                    if terminal:
-                        print(f"Epoch {epoch+1}, episode return = {ep_ret:.2f}, len = {ep_len}")
-                        obs, info = self.env.reset()
-                        obs = preprocess_obs(obs)
-                        ep_ret = 0.0
-                        ep_len = 0
+                surr1 = ratios * advantages
+                surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * advantages
+                loss = -torch.min(surr1, surr2).mean()
 
-            # PPO update at end of epoch
-            self.update()
+                self.actor_optim.zero_grad()
+                loss.backward(retain_graph=True)
+                self.actor_optim.step()
 
-        self.env.close()
+                V = self.critic(batch_obs.to(device)).squeeze()
+                value_loss = nn.MSELoss()(V, discounted_sum.detach().to(device))
 
-    def save_dataset(self, path="carracing_ppo_dataset.npz"):
-        obs = np.stack(self.dataset_obs, axis=0)         # (N,4,84,84)
-        actions = np.stack(self.dataset_actions, axis=0) # (N,3)
-        rewards = np.array(self.dataset_rewards, dtype=np.float32)
-        dones = np.array(self.dataset_dones, dtype=np.float32)
+                self.critic_optim.zero_grad()
+                value_loss.backward()
+                self.critic_optim.step()
 
-        np.savez_compressed(
-            path,
-            obs=obs,
-            actions=actions,
-            rewards=rewards,
-            dones=dones,
-        )
-        print(f"Saved dataset to {path} with {obs.shape[0]} transitions")
-
-
-def main():
-    cfg = PPOConfig(
-        total_steps=200_000,       # increase if you want a better expert
-        steps_per_epoch=2048,
-        gamma=0.99,
-        lam=0.95,
-        clip_ratio=0.2,
-        pi_lr=3e-4,
-        v_lr=1e-3,
-        train_pi_iters=80,
-        train_v_iters=80,
-        max_ep_len=1000,
-    )
-
-    agent = PPOAgent(cfg)
-    agent.train()
-    agent.save_dataset("carracing_ppo_dataset.npz")
-
+# --- Main Execution ---
 
 if __name__ == "__main__":
-    main()
+    # 1. Initialize and Train
+    # Set episodes=1500 as per your original request
+    model = PPO(episodes=1500) 
+    model.train()
+
+    # 2. Final Plot (just in case)
+    print("Final Plot Generation...")
+    plot_results(model._total_rewards)
+
+    # 3. Evaluation Phase
+    print("Starting Evaluation...")
+    eval_env = gym.make('CarRacing-v2', continuous=False, render_mode='rgb_array')
+    eval_env = CarEnvironment(eval_env)
+
+    frames = []
+    scores = 0
+    s, _ = eval_env.reset()
+
+    done, ret = False, 0
+
+    while not done:
+        frames.append(eval_env.render())
+        s = torch.tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+        
+        # Select Best Action (Argmax) for evaluation
+        a = torch.argmax(model.actor(s), dim=-1)
+        discrete_action = a.item() % 5
+        
+        s_prime, r, terminated, truncated, info = eval_env.step(discrete_action)
+        s = s_prime
+        ret += r
+        done = terminated or truncated
+        
+        if terminated:
+            print("Evaluation Episode Terminated")
+    
+    scores += ret
+    print(f"Final Evaluation Score: {scores}")
+
+    # 4. Generate Video
+    animate(frames, "carracing_result.webm")
