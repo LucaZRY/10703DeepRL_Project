@@ -1,0 +1,13 @@
+# Core
+numpy
+torch          # install with correct CUDA version from pytorch.org
+torchvision
+
+# RL environment
+gymnasium[box2d]
+pygame
+
+# Logging & plotting
+matplotlib
+tensorboard
+imageio
