@@ -11,26 +11,6 @@ from gymnasium.wrappers import GrayScaleObservation, ResizeObservation, FrameSta
 
 # --- 1. ARCHITECTURES ---
 
-class StudentMLP(nn.Module):
-    """
-    Simple MLP for vector-based environments (BipedalWalker, etc.).
-    NOT recommended for CarRacing images.
-    """
-    def __init__(self, state_dim: int, act_dim: int, hidden_dim: int = 256, num_hidden_layers: int = 2):
-        super().__init__()
-        layers: List[nn.Module] = []
-        input_dim = state_dim
-        for _ in range(num_hidden_layers):
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.GELU())
-            input_dim = hidden_dim
-        layers.append(nn.Linear(input_dim, act_dim))
-        layers.append(nn.Tanh())
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
 class CNNPolicy(nn.Module):
     """
     CNN Policy specifically for CarRacing (4x96x96 input).
@@ -93,23 +73,44 @@ def preprocess_obs(obs):
 def load_dataset(dataset_dir: str) -> Tuple[np.ndarray, np.ndarray]:
     states_path = os.path.join(dataset_dir, "states.npy")
     actions_path = os.path.join(dataset_dir, "actions.npy")
-    if not os.path.exists(states_path):
-        # Fallback to .npz if .npy doesn't exist (support your format)
+    
+    states, actions = None, None
+
+    if os.path.exists(states_path):
+        states = np.load(states_path).astype(np.float32)
+        actions = np.load(actions_path).astype(np.float32)
+    else:
+        # Fallback to .npz
         npz_path = os.path.join(dataset_dir, "expert_trajectories.npz")
         if os.path.exists(npz_path):
             data = np.load(npz_path)
-            return data["states"].astype(np.float32), data["actions"].astype(np.float32)
-        raise FileNotFoundError(f"No data found in {dataset_dir}")
-    return np.load(states_path).astype(np.float32), np.load(actions_path).astype(np.float32)
+            states = data["states"].astype(np.float32)
+            actions = data["actions"].astype(np.float32)
+        else:
+            raise FileNotFoundError(f"No data found in {dataset_dir}")
+    
+    # --- CRITICAL FIX: FLATTEN 3D EPISODES TO 2D SAMPLES ---
+    # Shape (N_ep, Time, Dim) -> (Total_Samples, Dim)
+    if states.ndim == 3:
+        print(f"Detected 3D dataset {states.shape}. Flattening...")
+        N, T, D = states.shape
+        states = states.reshape(N * T, D)
+        actions = actions.reshape(N * T, actions.shape[-1])
+        
+        # Remove padding (zeros)
+        # Assuming padding rows are all zeros or very close to zero
+        mask = np.abs(states).sum(axis=1) > 1e-6
+        states = states[mask]
+        actions = actions[mask]
+        print(f"Flattened and filtered. New shape: {states.shape}")
+    # -------------------------------------------------------
+
+    return states, actions
 
 
 # --- 3. TRAINING LOOPS ---
 
 def build_dataloader(states: np.ndarray, actions: np.ndarray, batch_size: int, shuffle: bool = True) -> DataLoader:
-    # If using CNN, input is likely (N, 36864) flattened, need to reshape to (N, 4, 96, 96) inside model or here
-    # For simplicity, we assume the CNNPolicy expects (B, 4, 96, 96)
-    # If dataset is flattened, we reshape it on the fly or in the dataset
-    
     # Check if this is image data (flattened size 36864)
     if states.shape[-1] == 36864: 
         # Reshape to (N, 4, 96, 96) for CNN
@@ -184,9 +185,8 @@ def run_dagger(
 ):
     print(f"--- Starting DAgger ---")
     
-    # 1. Load Expert (Diffusion)
-    # We import locally to avoid dependency errors if not present
-    from dagger_online import DiffusionExpert # Assumes dagger_online.py is in same folder
+    # Import locally
+    from dagger_online import DiffusionExpert 
     
     if not os.path.exists(expert_model_path):
         print(f"Error: Expert model not found at {expert_model_path}")
@@ -196,8 +196,7 @@ def run_dagger(
     dataset = ImitationDataset()
     env = make_env()
 
-    # 2. Warm Start (Load Offline Data)
-    # Reuse your existing loading logic here, adapted for the dataset class
+    # Reuse dagger_online loading
     from dagger_online import load_fixed_offline_buffer, DAggerConfig
     cfg = DAggerConfig(ppo_npz_path=offline_data_path, seed_max_samples=50000)
     load_fixed_offline_buffer(dataset, cfg)
@@ -207,8 +206,7 @@ def run_dagger(
 
     # Initial BC
     print("[DAgger] Warm Start BC...")
-    for _ in range(5): # 5 epochs
-        # Simple training loop for ImitationDataset
+    for _ in range(5): 
         student.train()
         steps = len(dataset) // 64
         for _ in range(steps):
@@ -217,7 +215,7 @@ def run_dagger(
             loss_fn(student(obs), act).backward()
             optimizer.step()
 
-    # 3. DAgger Loop
+    # Loop
     for it in range(num_iterations):
         print(f"\n=== DAgger Iteration {it+1}/{num_iterations} ===")
         
@@ -231,11 +229,10 @@ def run_dagger(
                 obs_proc = preprocess_obs(obs)
                 obs_t = torch.tensor(obs_proc, device=device).unsqueeze(0)
                 
-                # Student Act
                 with torch.no_grad():
                     student_act = student(obs_t).cpu().numpy()[0]
                 
-                # Expert Query (Pass 'steps'!)
+                # Pass steps to expert
                 expert_act = expert.get_action(obs_proc, t=steps)
                 
                 dataset.add(obs_proc, expert_act)
@@ -269,21 +266,19 @@ def main():
     parser = argparse.ArgumentParser(description="Train student policies.")
     parser.add_argument("--mode", type=str, choices=["baseline", "offline_distill", "dagger"], default="dagger")
     parser.add_argument("--data_dir", type=str, default="data/human_expert", help="Folder containing .npz data")
-    parser.add_argument("--expert_ckpt", type=str, default="results/diffusion_expert/human_expert_96.pt")
+    parser.add_argument("--expert_ckpt", type=str, default="results/diffusion_expert/perfect_expert_96.pt")
     parser.add_argument("--save_path", type=str, default="results/student_model.pt")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     device = torch.device(args.device)
     
-    # 1. Initialize CNN Policy (CarRacing)
-    # We ignore MLP args because we know this is for CarRacing
+    # Initialize CNN Policy
     student = CNNPolicy().to(device)
     print(f"Initialized CNN Student on {device}")
 
-    # 2. Select Mode
+    # Select Mode
     if args.mode == "dagger":
-        # Online DAgger Training
         student = run_dagger(
             student=student,
             expert_model_path=args.expert_ckpt,
@@ -294,20 +289,27 @@ def main():
         print(f"Saved DAgger student to {args.save_path}")
 
     else:
-        # Offline BC Training (Baseline or Distill)
+        # Offline BC Training
         print(f"Loading offline data from {args.data_dir}...")
         try:
             states, actions = load_dataset(args.data_dir)
-            dataloader = build_dataloader(states, actions, batch_size=256)
+            
+            # MEMORY CHECK: If > 100k samples, warn or subset
+            if len(states) > 200000:
+                print(f"Warning: Large dataset ({len(states)} samples). This might take a lot of RAM.")
+            
+            dataloader = build_dataloader(states, actions, batch_size=64) # Smaller batch size to help
             
             print(f"Training Offline BC ({args.mode})...")
-            train_student_bc(student, dataloader, num_epochs=50, device=device)
+            train_student_bc(student, dataloader, num_epochs=20, device=device)
             
             torch.save(student.state_dict(), args.save_path)
             print(f"Saved offline student to {args.save_path}")
             
         except Exception as e:
             print(f"Failed to run offline training: {e}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     main()
