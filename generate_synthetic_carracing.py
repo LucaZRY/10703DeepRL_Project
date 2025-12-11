@@ -6,8 +6,8 @@ from train_diffusion import DiffusionExpertTrainer, load_expert_data
 from src.models import PolicyDiffusionTransformer  # same as in train_diffusion.py
 
 def main():
-    expert_dir = "data/expert_carracing"
-    ckpt_path  = "results/diffusion_expert/carracing_expert_96.pt"  
+    expert_dir = "data/human_expert"
+    ckpt_path  = "results/diffusion_expert/human_expert_96.pt"
     out_dir    = "data/generated_carracing"
 
     os.makedirs(out_dir, exist_ok=True)
